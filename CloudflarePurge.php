@@ -58,11 +58,27 @@ class CloudflarePurge {
 			return;
 		}
 
+		$urls = [ $url ];
+		$extraHosts = $config->get( 'CloudflarePurgeExtraHosts' );
+		if ( $extraHosts ) {
+			$parsed = parse_url( $url );
+			foreach ( $extraHosts as $host ) {
+				$extra = $parsed['scheme'] . '://' . $host;
+				if ( isset( $parsed['path'] ) ) {
+					$extra .= $parsed['path'];
+				}
+				if ( isset( $parsed['query'] ) ) {
+					$extra .= '?' . $parsed['query'];
+				}
+				$urls[] = $extra;
+			}
+		}
+
 		$curl = curl_init();
 		curl_setopt( $curl, CURLOPT_URL, 'https://api.cloudflare.com/client/v4/zones/' . $zoneID . '/purge_cache' );
 		curl_setopt( $curl, CURLOPT_RETURNTRANSFER, 1 );
 
-		$data = json_encode( [ 'files' => [ $url ] ] );
+		$data = json_encode( [ 'files' => $urls ] );
 		curl_setopt( $curl, CURLOPT_POST, true );
 		curl_setopt( $curl, CURLOPT_POSTFIELDS, $data );
 		curl_setopt( $curl, CURLOPT_HTTPHEADER, $headers );

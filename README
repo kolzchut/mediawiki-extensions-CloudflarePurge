@@ -1,3 +1,35 @@
 # CloudflarePurge
 
 https://www.mediawiki.org/wiki/Extension:CloudflarePurge
+
+Fork of the upstream WMF extension with support for purging additional
+hostnames (e.g. kiosk subdomains) alongside the canonical URL.
+
+## Configuration
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `$wgCloudflarePurgeZoneID` | string | `""` | Cloudflare zone ID |
+| `$wgCloudflarePurgeToken` | string | `""` | API token with Zone.Cache Purge permission (recommended) |
+| `$wgCloudflarePurgeAuthEmail` | string | `""` | Legacy auth: account email |
+| `$wgCloudflarePurgeAuthKey` | string | `""` | Legacy auth: global API key |
+| `$wgCloudflarePurgeExtraHosts` | array | `[]` | Additional hostnames to purge (same path/query, different host) |
+
+## Extra hosts
+
+When `$wgCloudflarePurgeExtraHosts` is set, each page save or delete
+purges the canonical URL plus one variant per extra host. All URLs are
+sent in a single Cloudflare API call.
+
+Example — purge both `www.kolzchut.org.il` and `kiosk.kolzchut.org.il`:
+
+```php
+$wgCloudflarePurgeExtraHosts = [ 'kiosk.kolzchut.org.il' ];
+```
+
+### API limit
+
+Cloudflare's `purge_cache` endpoint accepts a maximum of **30 URLs per
+request**. With 1 canonical URL + N extra hosts, you can have up to 29
+extra hosts before hitting the limit. In practice this is not a concern
+(1-2 extra hosts is the expected usage).
