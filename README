@@ -2,8 +2,34 @@
 
 https://www.mediawiki.org/wiki/Extension:CloudflarePurge
 
-Fork of the upstream WMF extension with support for purging additional
-hostnames (e.g. kiosk subdomains) alongside the canonical URL.
+Fork of the upstream WMF extension, with:
+
+- purging of every page affected by an edit, not just the edited page;
+- support for purging additional hostnames (e.g. kiosk subdomains)
+  alongside the canonical URL.
+
+## What gets purged
+
+Upstream hooks `PageSaveComplete` / `PageDeleteComplete` and purges the
+one URL of the page that was saved or deleted. That leaves every page
+which *transcludes* the edited page stale at the edge for a full TTL —
+which for a wiki whose templates carry benefit amounts and eligibility
+thresholds is a correctness problem, not a latency one.
+
+MediaWiki already knows the full set. `WikiPage::onArticleEdit()` queues
+`HTMLCacheUpdateJob` for the `templatelinks`, `imagelinks` and `redirect`
+backlinks of the edited title; those jobs walk the backlinks in batches of
+`$wgUpdateRowsPerJob`, and hand the resulting URLs to
+`CdnCacheUpdate::purge()`. That method broadcasts them on the
+`cdn-url-purges` event channel *before* falling back to `$wgCdnServers`.
+
+So this extension subscribes to that channel (`CloudflarePurgeRelayer`)
+rather than walking backlinks itself. The fan-out, the batching, the
+de-duplication and the job-queue scheduling are core's. When the relay is
+active the two page hooks stand down, because core already purges the
+edited page itself.
+
+`$wgCdnServers` may stay empty — the relayer is invoked regardless of it.
 
 ## Configuration
 
@@ -14,22 +40,59 @@ hostnames (e.g. kiosk subdomains) alongside the canonical URL.
 | `$wgCloudflarePurgeAuthEmail` | string | `""` | Legacy auth: account email |
 | `$wgCloudflarePurgeAuthKey` | string | `""` | Legacy auth: global API key |
 | `$wgCloudflarePurgeExtraHosts` | array | `[]` | Additional hostnames to purge (same path/query, different host) |
+| `$wgCloudflarePurgeUseCdnRelay` | bool | `true` | Subscribe to `cdn-url-purges`. Set to `false` to fall back to purging only the edited page. |
+| `$wgCloudflarePurgeMaxUrlsPerBatch` | int | `1000` | Ceiling on URLs per purge call; `0` disables the ceiling |
+| `$wgCloudflarePurgeUrlsPerRequest` | int | `100` | URLs per Cloudflare API request |
+| `$wgCloudflarePurgeMaxRetries` | int | `2` | Retries for a transport failure, HTTP 429 or 5xx |
 
 ## Extra hosts
 
-When `$wgCloudflarePurgeExtraHosts` is set, each page save or delete
-purges the canonical URL plus one variant per extra host. All URLs are
-sent in a single Cloudflare API call.
-
-Example — purge both `www.kolzchut.org.il` and `kiosk.kolzchut.org.il`:
+When `$wgCloudflarePurgeExtraHosts` is set, every purged URL is also
+purged under each extra host, keeping the same path and query.
 
 ```php
 $wgCloudflarePurgeExtraHosts = [ 'kiosk.kolzchut.org.il' ];
 ```
 
-### API limit
+Extra hosts multiply the fan-out, so they are counted against
+`$wgCloudflarePurgeMaxUrlsPerBatch` rather than added on top of it.
 
-Cloudflare's `purge_cache` endpoint accepts a maximum of **30 URLs per
-request**. With 1 canonical URL + N extra hosts, you can have up to 29
-extra hosts before hitting the limit. In practice this is not a concern
-(1-2 extra hosts is the expected usage).
+## Fan-out and rate limits
+
+Cloudflare's single-file purge accepts **100 URLs per request** on
+Free/Pro/Business (500 on Enterprise), and meters URLs per second per
+account: 800/s on Free, 1500/s on Pro and Business, 3000/s on Enterprise.
+Requests are therefore split at `$wgCloudflarePurgeUrlsPerRequest`.
+
+What bounds a single call is core, not this extension: one
+`HTMLCacheUpdateJob` carries at most `$wgUpdateRowsPerJob` (default 300)
+pages, one URL each — backlink purges pass
+`PURGE_URLS_LINKSUPDATE_ONLY`, so no `action=history` or `action=raw`
+variants are added — multiplied by one plus the number of extra hosts.
+`$wgCloudflarePurgeMaxUrlsPerBatch` therefore does not bind in normal
+operation; it is a circuit breaker for a caller that hands over an
+unbounded list, and tripping it is logged at error level because the
+discarded pages will stay stale.
+
+A widely transcluded template still produces a large *total* fan-out —
+several thousand URLs is normal — but it arrives as a stream of jobs, so
+the job queue, not this extension, is what paces it.
+
+## Failure behaviour
+
+A failed purge is logged to the `CloudflarePurge` channel and reported
+through the return value; it is never thrown. The caller is usually a
+job, and a job that throws is lost outright on installations without a
+working retry path — while the `page_touched` bump it already made means
+a re-run would be a no-op anyway. Losing the purge but keeping the log
+line is the lesser failure, and the log line is alertable.
+
+Transport failures, HTTP 429 and 5xx are retried
+(`$wgCloudflarePurgeMaxRetries`) with a short exponential backoff.
+
+## Tests
+
+`tests/phpunit/unit` holds dependency-free tests of the fan-out
+arithmetic and the channel registration; `tests/phpunit/integration`
+covers the end-to-end behaviour (a template edit purges its transcluding
+pages) and needs a database.
