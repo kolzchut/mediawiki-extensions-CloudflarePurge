@@ -251,7 +251,7 @@ class CloudflarePurge {
 	) {
 		$chunks = array_values( $chunks );
 		$ok = true;
-		$attempted = 0;
+		$purged = 0;
 
 		foreach ( $chunks as $i => $chunk ) {
 			// Two ways the budget can stop us, and both must defer rather than
@@ -262,21 +262,22 @@ class CloudflarePurge {
 			// the abandoned URLs are the ones we were in the middle of.
 			if ( $budget->isExhausted( static::now() ) ) {
 				return static::abandonFrom(
-					$chunks, $i, $totalUrls, $attempted, $budget, $logger,
+					$chunks, $i, $totalUrls, $purged, $budget, $logger,
 					'no time left to start the request'
 				);
 			}
 
-			$attempted += count( $chunk );
 			$status = static::sendChunk( $chunk, $zoneID, $headers, $retries, $logger, $budget );
 
 			if ( $status === self::CHUNK_OUT_OF_TIME ) {
 				return static::abandonFrom(
-					$chunks, $i, $totalUrls, $attempted, $budget, $logger,
+					$chunks, $i, $totalUrls, $purged, $budget, $logger,
 					'time ran out mid-request'
 				);
 			}
-			if ( $status !== self::CHUNK_OK ) {
+			if ( $status === self::CHUNK_OK ) {
+				$purged += count( $chunk );
+			} else {
 				$ok = false;
 			}
 		}
@@ -293,14 +294,14 @@ class CloudflarePurge {
 	 * @param string[][] $chunks
 	 * @param int $from Index of the first chunk that was not purged
 	 * @param int $totalUrls
-	 * @param int $attempted
+	 * @param int $purged URLs confirmed purged before the budget stopped us
 	 * @param CloudflarePurgeBudget $budget
 	 * @param Psr\Log\LoggerInterface $logger
 	 * @param string $reason
 	 * @return false
 	 */
 	private static function abandonFrom(
-		array $chunks, int $from, int $totalUrls, int $attempted,
+		array $chunks, int $from, int $totalUrls, int $purged,
 		CloudflarePurgeBudget $budget, $logger, string $reason
 	) {
 		$unsent = array_merge( ...array_slice( $chunks, $from ) );
@@ -323,7 +324,11 @@ class CloudflarePurge {
 				// by us.
 				'disposition' => $deferred ? 'queued for the job queue' : 'DROPPED',
 				'deferred' => $deferred,
-				'attempted' => $attempted,
+				// 'purged' and 'unsent' are disjoint and both count URLs, so
+				// they can be read together. What they do not sum to is the
+				// balance: chunks that failed on their own merits before the
+				// budget ran out.
+				'purged' => $purged,
 				'requestsDone' => $from,
 				'requestsTotal' => count( $chunks ),
 				'budget' => $budget->budgetSeconds(),
@@ -465,8 +470,25 @@ class CloudflarePurge {
 				$budget->isLimited()
 			);
 
-			$outOfTime = $delay !== null
-				&& !$budget->permitsSleep( $delay, static::now() );
+			// Which of the two ended this, when both could have. Retry
+			// exhaustion makes $delay null, so gating solely on $delay !== null
+			// let exhaustion win every tie — including the case where the
+			// budget is what truncated the final allowed attempt. That chunk
+			// then read as "failed on its merits" and was dropped rather than
+			// deferred, and the log said outOfTime=false about an attempt the
+			// deadline had just cut short.
+			//
+			// It also made CHUNK_OUT_OF_TIME unreachable whenever
+			// $wgCloudflarePurgeMaxRetries is 0, since retryDelaySeconds()
+			// returns null on the first attempt: the mid-ladder deferral
+			// simply never fired.
+			//
+			// isExhausted() is false for an unlimited budget by construction,
+			// so the job path can still never produce CHUNK_OUT_OF_TIME and a
+			// deferred purge cannot re-enter the branch that deferred it.
+			$outOfTime = $delay === null
+				? $budget->isExhausted( static::now() )
+				: !$budget->permitsSleep( $delay, static::now() );
 
 			if ( $delay === null || $outOfTime ) {
 				$logger->error(

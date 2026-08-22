@@ -240,6 +240,67 @@ class CloudflarePurgeLadderTest extends TestCase {
 	}
 
 	/**
+	 * The tie between "out of retries" and "out of time", on the attempt where
+	 * both are true.
+	 *
+	 * Retry exhaustion makes the retry policy return null, so a naive
+	 * "$delay !== null" gate let exhaustion win every tie — including the case
+	 * where the budget is what truncated the final allowed attempt. The chunk
+	 * then read as failed-on-its-merits and was dropped rather than deferred,
+	 * and the log claimed outOfTime=false about an attempt the deadline had
+	 * just cut short.
+	 *
+	 * Default config, and a prod-plausible shape: Cloudflare answers 500
+	 * cheaply twice, then stops answering at all.
+	 */
+	public function testAChunkTruncatedOnItsFinalAttemptIsDeferred() {
+		CloudflarePurgeLadderProbe::$script = [
+			[ 'status' => 500, 'cost' => 'none' ],
+			[ 'status' => 500, 'cost' => 'none' ],
+			[ 'status' => null, 'curlErrno' => 28, 'cost' => 'total' ],
+		];
+		$urls = [ 'https://example.org/A', 'https://example.org/B' ];
+
+		$ok = CloudflarePurgeLadderProbe::runChunks(
+			[ $urls ], 2, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertFalse( $ok );
+		$this->assertSame( 3, CloudflarePurgeLadderProbe::attempts() );
+		// The budget shrank each attempt in turn, and the third was cut short
+		// by it rather than running to the 15s per-request timeout.
+		$this->assertSame(
+			[ 5.0, 4.75, 4.25 ],
+			array_column( CloudflarePurgeLadderProbe::$granted, 1 )
+		);
+		$this->assertEqualsWithDelta( 5.0, CloudflarePurgeLadderProbe::$clock, 1e-9 );
+
+		$this->assertSame( $urls, CloudflarePurgeLadderProbe::$deferred );
+		$errors = $this->logger->contextsAt( 'error' );
+		$this->assertTrue( $errors[0]['outOfTime'] );
+		$this->assertSame( 'time ran out mid-request', end( $errors )['reason'] );
+	}
+
+	/**
+	 * The same root cause at its extreme. With retries disabled the policy
+	 * returns null on the very first attempt, so under the old gate
+	 * CHUNK_OUT_OF_TIME was unreachable and the mid-ladder deferral could
+	 * never fire at all.
+	 */
+	public function testTheDeferralStillFiresWithRetriesDisabled() {
+		CloudflarePurgeLadderProbe::$cost = 'total';
+		$urls = [ 'https://example.org/A' ];
+
+		$ok = CloudflarePurgeLadderProbe::runChunks(
+			[ $urls ], 0, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertFalse( $ok );
+		$this->assertSame( 1, CloudflarePurgeLadderProbe::attempts() );
+		$this->assertSame( $urls, CloudflarePurgeLadderProbe::$deferred );
+	}
+
+	/**
 	 * With several chunks, the deferral covers the one the budget cut off *and*
 	 * everything behind it — not just the ones that never started.
 	 */
@@ -334,7 +395,10 @@ class CloudflarePurgeLadderTest extends TestCase {
 	}
 
 	/**
-	 * A call that fits its budget defers nothing at all.
+	 * The other side of that tie, and the one that must not move: retries
+	 * exhausted while the budget still has room is a genuine failure, not a
+	 * clip. Deferring it would hand the job queue work the retry policy has
+	 * already decided against.
 	 */
 	public function testNothingIsDeferredWhenTheBudgetIsNotExhausted() {
 		CloudflarePurgeLadderProbe::$cost = 'none';

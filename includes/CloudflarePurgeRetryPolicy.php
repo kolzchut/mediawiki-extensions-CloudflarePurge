@@ -67,8 +67,9 @@ class CloudflarePurgeRetryPolicy {
 	 * loadable without ext-curl; the numbers are part of libcurl's ABI and
 	 * are never reassigned. 51 is kept for completeness only: libcurl aliased
 	 * CURLE_SSL_CACERT to 60 in 7.62 (curl.h), so 51 cannot fire on any
-	 * currently shipping build — curl_strerror( 51 ) already returns "Unknown
-	 * error". 60 is the live code, and it is peer-certificate verification.
+	 * currently shipping build — curl_easy_strerror() already returns "Unknown
+	 * error" for it (PHP exposes neither that function nor curl_strerror).
+	 * 60 is the live code, and it is peer-certificate verification.
 	 */
 	private const PERMANENT_CURL_ERRORS = [
 		1 => 'unsupported protocol',

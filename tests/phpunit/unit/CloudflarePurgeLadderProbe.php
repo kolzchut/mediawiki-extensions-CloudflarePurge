@@ -51,6 +51,19 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 	/** @var bool Whether the scripted request succeeds after consuming its time */
 	public static $succeeds = false;
 
+	/**
+	 * Per-attempt overrides, consumed in order and then exhausted.
+	 *
+	 * Each entry may set 'status', 'curlErrno' and 'cost'; anything it omits
+	 * falls back to the scalar defaults above. Needed for the ladders whose
+	 * behaviour changes partway through — an API that answers 500 cheaply a
+	 * couple of times and then stops answering at all, which is what makes the
+	 * budget truncate the *final* allowed attempt rather than an early one.
+	 *
+	 * @var array[]
+	 */
+	public static $script = [];
+
 	public static function reset() {
 		self::$clock = 0.0;
 		self::$curlErrno = 28;
@@ -60,6 +73,7 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 		self::$deferred = null;
 		self::$deferSucceeds = true;
 		self::$succeeds = false;
+		self::$script = [];
 	}
 
 	/**
@@ -137,10 +151,13 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 		array $urls, string $zoneID, array $headers,
 		float $connectTimeout, float $totalTimeout
 	) {
+		$step = self::$script[ count( self::$granted ) ] ?? [];
 		self::$granted[] = [ $connectTimeout, $totalTimeout ];
-		if ( self::$cost === 'connect' ) {
+
+		$cost = $step['cost'] ?? self::$cost;
+		if ( $cost === 'connect' ) {
 			self::$clock += min( $connectTimeout, $totalTimeout );
-		} elseif ( self::$cost === 'total' ) {
+		} elseif ( $cost === 'total' ) {
 			self::$clock += $totalTimeout;
 		}
 
@@ -156,9 +173,9 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 
 		return [
 			'ok' => false,
-			'status' => self::$status,
+			'status' => array_key_exists( 'status', $step ) ? $step['status'] : self::$status,
 			'error' => 'scripted failure',
-			'curlErrno' => self::$curlErrno,
+			'curlErrno' => $step['curlErrno'] ?? self::$curlErrno,
 			'retryAfter' => null,
 		];
 	}
