@@ -204,24 +204,52 @@ class CloudflarePurge {
 			(float)$config->get( 'CloudflarePurgePreSendBudgetSeconds' )
 		);
 
+		return static::sendChunks(
+			$chunks, $zoneID, $headers, $retries, $logger, $budget, $set->getUrlCount()
+		);
+	}
+
+	/**
+	 * Send every chunk, stopping if the wall-clock budget runs out.
+	 *
+	 * Split out from purgeUrls() so the deadline's effect on a multi-chunk
+	 * call can be tested without a MediaWiki config.
+	 *
+	 * @param string[][] $chunks
+	 * @param string $zoneID
+	 * @param string[] $headers
+	 * @param int $retries
+	 * @param Psr\Log\LoggerInterface $logger
+	 * @param CloudflarePurgeBudget $budget
+	 * @param int $totalUrls URLs across all chunks, for the log line
+	 * @return bool
+	 */
+	protected static function sendChunks(
+		array $chunks, string $zoneID, array $headers, int $retries, $logger,
+		CloudflarePurgeBudget $budget, int $totalUrls
+	) {
 		$ok = true;
 		$attempted = 0;
-		$i = 0;
+		$done = 0;
 		foreach ( $chunks as $chunk ) {
 			if ( $budget->isExhausted( static::now() ) ) {
-				// Everything from here on stays stale until its TTL expires,
-				// which is exactly the failure this extension exists to
-				// prevent. Say so at error level, with the numbers.
-				$unsent = array_sum( array_map( 'count', array_slice( $chunks, $i ) ) );
+				$unsent = array_merge( ...array_slice( array_values( $chunks ), $done ) );
+				// Clipping the call must not become the very thing this
+				// extension exists to prevent, so what the budget did not
+				// reach is handed to the job queue rather than dropped. The
+				// job runs in CLI, where the budget is unlimited, so it gets
+				// the full ladder and cannot re-enter this branch.
+				$deferred = static::deferUrls( $unsent );
 				$logger->error(
-					'Cloudflare purge abandoned after time budget: {unsent} of {total} URLs not purged',
+					'Cloudflare purge stopped by time budget: {unsent} of {total} URLs {disposition}',
 					[
-						'unsent' => $unsent,
-						'total' => $set->getUrlCount(),
+						'unsent' => count( $unsent ),
+						'total' => $totalUrls,
+						'disposition' => $deferred ? 'deferred to the job queue' : 'DROPPED',
+						'deferred' => $deferred,
 						'attempted' => $attempted,
-						'requestsDone' => $i,
+						'requestsDone' => $done,
 						'requestsTotal' => count( $chunks ),
-						'budget' => (float)$config->get( 'CloudflarePurgePreSendBudgetSeconds' ),
 						'firstUrl' => $chunk[0] ?? '',
 					]
 				);
@@ -229,10 +257,43 @@ class CloudflarePurge {
 			}
 			$ok = static::sendChunk( $chunk, $zoneID, $headers, $retries, $logger, $budget ) && $ok;
 			$attempted += count( $chunk );
-			$i++;
+			$done++;
 		}
 
 		return $ok;
+	}
+
+	/**
+	 * Hand URLs back to MediaWiki's own delayed-purge job.
+	 *
+	 * CdnPurgeJob::run() calls CdnCacheUpdate::purge(), which broadcasts on
+	 * 'cdn-url-purges' and so arrives back here — on the job runner, in CLI,
+	 * with no budget. Core uses the same job for its rebound purges.
+	 *
+	 * lazyPush() rather than push() because this is called from the path where
+	 * the response has not been flushed: the enqueue itself must not become
+	 * the next thing the editor waits on.
+	 *
+	 * @param string[] $urls
+	 * @return bool Whether the URLs were successfully handed over
+	 */
+	protected static function deferUrls( array $urls ) {
+		if ( !$urls ) {
+			return true;
+		}
+		if ( !class_exists( CdnPurgeJob::class ) ) {
+			return false;
+		}
+		try {
+			MediaWikiServices::getInstance()->getJobQueueGroup()->lazyPush(
+				new CdnPurgeJob( [ 'urls' => array_values( $urls ) ] )
+			);
+		} catch ( Throwable $e ) {
+			// Never throw from a purge; see purgeUrls().
+			return false;
+		}
+
+		return true;
 	}
 
 	/**
@@ -317,7 +378,8 @@ class CloudflarePurge {
 				$retries,
 				$result['status'],
 				$result['curlErrno'],
-				$result['retryAfter']
+				$result['retryAfter'],
+				$budget->isLimited()
 			);
 
 			$outOfTime = $delay !== null

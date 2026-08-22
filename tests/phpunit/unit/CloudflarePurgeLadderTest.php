@@ -143,9 +143,12 @@ class CloudflarePurgeLadderTest extends TestCase {
 	 * A DNS blip: before this change the ladder made exactly one attempt and
 	 * dropped the purge. See CloudflarePurgeRetryPolicyTest for the
 	 * classification itself; this is the ladder acting on it.
+	 *
+	 * On the job path — no budget, nobody waiting, and the backlink fan-out to
+	 * protect — it gets the full configured ladder.
 	 */
-	public function testAResolverFailureIsRetriedOnceAndOnlyOnce() {
-		CloudflarePurgeLadderProbe::$cost = 'connect';
+	public function testAResolverFailureGetsTheFullLadderWhenNothingIsWaiting() {
+		CloudflarePurgeLadderProbe::$cost = 'none';
 		// 6 = CURLE_COULDNT_RESOLVE_HOST
 		CloudflarePurgeLadderProbe::$curlErrno = 6;
 
@@ -154,9 +157,28 @@ class CloudflarePurgeLadderTest extends TestCase {
 			CloudflarePurgeBudget::unlimited()
 		);
 
-		$this->assertSame( 2, CloudflarePurgeLadderProbe::attempts() );
+		$this->assertSame( 3, CloudflarePurgeLadderProbe::attempts() );
 		$errors = $this->logger->contextsAt( 'error' );
 		$this->assertSame( 'fast-retry', $errors[0]['transport'] );
+	}
+
+	/**
+	 * ...and one retry, not three, where an editor is waiting for the save.
+	 */
+	public function testAResolverFailureIsCappedAtOneRetryUnderABudget() {
+		CloudflarePurgeLadderProbe::$cost = 'none';
+		CloudflarePurgeLadderProbe::$curlErrno = 6;
+
+		CloudflarePurgeLadderProbe::runChunk(
+			[ 'https://example.org/A' ], 2, $this->logger,
+			CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertSame( 2, CloudflarePurgeLadderProbe::attempts() );
+		// The budget was nowhere near spent — the cap is what stopped it.
+		$this->assertEqualsWithDelta( 0.25, CloudflarePurgeLadderProbe::$clock, 1e-9 );
+		$errors = $this->logger->contextsAt( 'error' );
+		$this->assertFalse( $errors[0]['outOfTime'] );
 	}
 
 	/**
@@ -176,5 +198,71 @@ class CloudflarePurgeLadderTest extends TestCase {
 		$this->assertSame( 1, CloudflarePurgeLadderProbe::attempts() );
 		$errors = $this->logger->contextsAt( 'error' );
 		$this->assertSame( 'permanent', $errors[0]['transport'] );
+	}
+
+	/**
+	 * The budget must not become the very thing this extension exists to
+	 * prevent. What it clips is handed to MediaWiki's own CdnPurgeJob, which
+	 * re-enters purgeUrls() from the job runner — in CLI, with no budget.
+	 */
+	public function testWhatTheBudgetClipsIsDeferredRatherThanDropped() {
+		CloudflarePurgeLadderProbe::$cost = 'total';
+		$chunks = [
+			[ 'https://example.org/A', 'https://example.org/B' ],
+			[ 'https://example.org/C' ],
+			[ 'https://example.org/D' ],
+		];
+
+		$ok = CloudflarePurgeLadderProbe::runChunks(
+			$chunks, 2, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertFalse( $ok );
+		// The first chunk consumed the whole budget; the rest never started.
+		$this->assertSame(
+			[ 'https://example.org/C', 'https://example.org/D' ],
+			CloudflarePurgeLadderProbe::$deferred
+		);
+
+		$errors = $this->logger->contextsAt( 'error' );
+		$budgetLine = end( $errors );
+		$this->assertSame( 2, $budgetLine['unsent'] );
+		$this->assertSame( 4, $budgetLine['total'] );
+		$this->assertTrue( $budgetLine['deferred'] );
+		$this->assertSame( 'deferred to the job queue', $budgetLine['disposition'] );
+	}
+
+	/**
+	 * A failed hand-over *is* a full-TTL stale page, so it must not read like
+	 * a successful deferral in the log.
+	 */
+	public function testAFailedHandOverIsReportedAsADrop() {
+		CloudflarePurgeLadderProbe::$cost = 'total';
+		CloudflarePurgeLadderProbe::$deferSucceeds = false;
+
+		CloudflarePurgeLadderProbe::runChunks(
+			[ [ 'https://example.org/A' ], [ 'https://example.org/B' ] ],
+			2, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$errors = $this->logger->contextsAt( 'error' );
+		$budgetLine = end( $errors );
+		$this->assertFalse( $budgetLine['deferred'] );
+		$this->assertSame( 'DROPPED', $budgetLine['disposition'] );
+	}
+
+	/**
+	 * A call that fits its budget defers nothing at all.
+	 */
+	public function testNothingIsDeferredWhenTheBudgetIsNotExhausted() {
+		CloudflarePurgeLadderProbe::$cost = 'none';
+		CloudflarePurgeLadderProbe::$curlErrno = 7;
+
+		CloudflarePurgeLadderProbe::runChunks(
+			[ [ 'https://example.org/A' ], [ 'https://example.org/B' ] ],
+			2, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertNull( CloudflarePurgeLadderProbe::$deferred );
 	}
 }

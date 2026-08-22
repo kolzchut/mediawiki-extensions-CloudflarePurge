@@ -29,8 +29,20 @@ class CloudflarePurgeDeadlineWallClockTest extends TestCase {
 	/** @var resource|null */
 	private $server;
 
+	/** @var array<string,string|false> */
+	private $savedProxyEnv = [];
+
 	protected function setUp(): void {
 		parent::setUp();
+		// libcurl honours http_proxy even for a loopback URL, so on a machine
+		// with one configured the request would go to the proxy — which
+		// answers immediately, and the timing this test measures would be the
+		// proxy's, not the deadline's. Reproduced: 0.25s and 0.75s instead of
+		// 0.6s and 1.6s.
+		foreach ( [ 'http_proxy', 'HTTP_PROXY', 'all_proxy', 'ALL_PROXY' ] as $var ) {
+			$this->savedProxyEnv[$var] = getenv( $var );
+			putenv( $var );
+		}
 		if ( !function_exists( 'curl_init' ) ) {
 			$this->markTestSkipped( 'ext-curl is required to exercise the real request path' );
 		}
@@ -48,6 +60,14 @@ class CloudflarePurgeDeadlineWallClockTest extends TestCase {
 	}
 
 	protected function tearDown(): void {
+		foreach ( $this->savedProxyEnv as $var => $value ) {
+			if ( $value === false ) {
+				putenv( $var );
+			} else {
+				putenv( "$var=$value" );
+			}
+		}
+		$this->savedProxyEnv = [];
 		if ( $this->server ) {
 			fclose( $this->server );
 			$this->server = null;

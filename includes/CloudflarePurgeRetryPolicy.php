@@ -28,10 +28,16 @@
  * went wrong", which covers a mid-handshake reset or an edge node cycling as
  * readily as a genuine misconfiguration.
  *
- * So those get exactly one fast retry rather than the full ladder. One retry
- * costs BASE_DELAY_MS on a path where an editor is waiting, and recovers the
- * blip; a full ladder would spend the whole time budget re-asking a resolver
- * that is genuinely down.
+ * So on a time-bounded path those get exactly one fast retry rather than the
+ * full ladder. One retry costs BASE_DELAY_MS where an editor is waiting and
+ * recovers the blip; a full ladder would spend the whole budget re-asking a
+ * resolver that is genuinely down.
+ *
+ * That justification reaches exactly as far as the budget does, so the cap
+ * does too. Where there is no budget — the job-queue path, which carries the
+ * backlink fan-out and which nobody is waiting on — the full ladder applies,
+ * because there a blip outlasting one 250 ms backoff would otherwise drop the
+ * larger and more valuable URL set for nothing saved.
  */
 class CloudflarePurgeRetryPolicy {
 
@@ -59,7 +65,8 @@ class CloudflarePurgeRetryPolicy {
 	 *
 	 * Numeric literals rather than the CURLE_* constants so this class stays
 	 * loadable without ext-curl; the numbers are part of libcurl's ABI and
-	 * are never reassigned.
+	 * are never reassigned. 51 is kept for completeness only — libcurl folded
+	 * it into 60 in 7.62, so it cannot fire on any currently shipping build.
 	 */
 	private const PERMANENT_CURL_ERRORS = [
 		1 => 'unsupported protocol',
@@ -74,8 +81,9 @@ class CloudflarePurgeRetryPolicy {
 
 	/**
 	 * libcurl CURLE_* codes that usually mean a lasting fault but are also
-	 * what a momentary one looks like. See the class docblock: these get
-	 * FAST_RETRY_ATTEMPTS retries, not $wgCloudflarePurgeMaxRetries.
+	 * what a momentary one looks like. See the class docblock: on a
+	 * time-bounded path these get FAST_RETRY_ATTEMPTS retries rather than
+	 * $wgCloudflarePurgeMaxRetries.
 	 */
 	private const FAST_RETRY_CURL_ERRORS = [
 		5 => 'could not resolve proxy',
@@ -128,6 +136,12 @@ class CloudflarePurgeRetryPolicy {
 	 * @param int|null $status HTTP status, or null for a transport failure
 	 * @param int $curlErrno cURL error number; only meaningful when $status is null
 	 * @param float|null $retryAfter Seconds requested by a Retry-After header
+	 * @param bool $timeBounded Whether the caller is running under a wall-clock
+	 *   budget. Only then is the fast-retry cap applied — see the class
+	 *   docblock. Defaults to false, the permissive value, so that a caller
+	 *   which forgets to say gets the full configured ladder rather than a cap
+	 *   it never asked for; on the pre-send path the budget itself is the
+	 *   backstop either way.
 	 * @return float|null Seconds to wait, or null to stop retrying
 	 */
 	public static function retryDelaySeconds(
@@ -135,7 +149,8 @@ class CloudflarePurgeRetryPolicy {
 		int $maxRetries,
 		?int $status,
 		int $curlErrno = 0,
-		?float $retryAfter = null
+		?float $retryAfter = null,
+		bool $timeBounded = false
 	): ?float {
 		if ( $attempt >= $maxRetries ) {
 			return null;
@@ -148,8 +163,10 @@ class CloudflarePurgeRetryPolicy {
 			if ( self::permanentTransportReason( $curlErrno ) !== null ) {
 				return null;
 			}
-			// ...and give the ambiguous ones one chance, not the full ladder.
-			if ( self::fastRetryTransportReason( $curlErrno ) !== null
+			// ...and where time is scarce, give the ambiguous ones one chance
+			// rather than the full ladder.
+			if ( $timeBounded
+				&& self::fastRetryTransportReason( $curlErrno ) !== null
 				&& $attempt >= self::FAST_RETRY_ATTEMPTS
 			) {
 				return null;

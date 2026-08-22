@@ -44,10 +44,10 @@ class CloudflarePurgeRetryPolicyTest extends TestCase {
 	 * discards its return value, and the page_touched bump makes a job re-run
 	 * a no-op. The page then serves stale from the edge for a full TTL.
 	 */
-	public function testAResolverFailureGetsOneRetry() {
+	public function testAResolverFailureIsRetried() {
 		// 6 = CURLE_COULDNT_RESOLVE_HOST
 		$this->assertSame( 0.25, CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 6 ) );
-		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6 ) );
+		$this->assertSame( 0.5, CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6 ) );
 
 		$this->assertNull( CloudflarePurgeRetryPolicy::permanentTransportReason( 6 ) );
 		$this->assertSame(
@@ -57,17 +57,60 @@ class CloudflarePurgeRetryPolicyTest extends TestCase {
 	}
 
 	/**
+	 * The cap reaches exactly as far as its justification does.
+	 *
+	 * "A full ladder would spend the whole time budget" is only an argument
+	 * where there is a budget. On the job-queue path there is none, nobody is
+	 * waiting, and that path carries the backlink fan-out — the larger and
+	 * more valuable URL set. Capping it there would drop that set to save
+	 * nothing.
+	 */
+	public function testTheFastRetryCapAppliesOnlyWhereTimeIsBounded() {
+		// Time-bounded: one retry, then stop.
+		$this->assertSame(
+			0.25,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 6, null, true )
+		);
+		$this->assertNull(
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6, null, true )
+		);
+
+		// Unbounded: the configured ladder, same as any other transient failure.
+		$this->assertSame(
+			0.5,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6, null, false )
+		);
+		$this->assertSame(
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 28, null, false ),
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6, null, false )
+		);
+	}
+
+	/**
 	 * 5 is the same argument for a proxied install, and 35 is libcurl's
 	 * catch-all for "the handshake went wrong" — which covers a mid-handshake
 	 * reset or an edge node cycling as readily as a real misconfiguration.
 	 * The genuinely permanent TLS errors are 51/58/59/60/77/83.
 	 */
-	public function testProxyResolutionAndHandshakeFailuresGetOneRetryToo() {
+	public function testProxyResolutionAndHandshakeFailuresAreRetriedToo() {
 		// 5 = CURLE_COULDNT_RESOLVE_PROXY, 35 = CURLE_SSL_CONNECT_ERROR
-		$this->assertSame( 0.25, CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 5 ) );
-		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 5 ) );
-		$this->assertSame( 0.25, CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 35 ) );
-		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 35 ) );
+		foreach ( [ 5, 35 ] as $errno ) {
+			$this->assertNull(
+				CloudflarePurgeRetryPolicy::permanentTransportReason( $errno ),
+				"errno $errno must not be permanent"
+			);
+			$this->assertSame(
+				0.25,
+				CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, $errno, null, true )
+			);
+			$this->assertNull(
+				CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, $errno, null, true )
+			);
+			$this->assertSame(
+				0.5,
+				CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, $errno, null, false )
+			);
+		}
 	}
 
 	/**
@@ -76,10 +119,18 @@ class CloudflarePurgeRetryPolicyTest extends TestCase {
 	 * pre-send budget re-asking it.
 	 */
 	public function testTheFastRetryCapIsNotRaisedByMaxRetries() {
-		$this->assertSame( 0.25, CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 9, null, 6 ) );
-		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 9, null, 6 ) );
+		$this->assertSame(
+			0.25,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 9, null, 6, null, true )
+		);
+		$this->assertNull(
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 9, null, 6, null, true )
+		);
 		// ...while an ordinary transient failure still gets the configured ladder.
-		$this->assertSame( 0.5, CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 9, null, 28 ) );
+		$this->assertSame(
+			0.5,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 9, null, 28, null, true )
+		);
 	}
 
 	/**

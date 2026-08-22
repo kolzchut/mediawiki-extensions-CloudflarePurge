@@ -42,12 +42,20 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 	/** @var array[] One [ connectTimeout, totalTimeout ] per attempt made */
 	public static $granted = [];
 
+	/** @var string[]|null URLs handed to the job queue, or null if never called */
+	public static $deferred = null;
+
+	/** @var bool What deferUrls() should report */
+	public static $deferSucceeds = true;
+
 	public static function reset() {
 		self::$clock = 0.0;
 		self::$curlErrno = 28;
 		self::$status = null;
 		self::$cost = 'total';
 		self::$granted = [];
+		self::$deferred = null;
+		self::$deferSucceeds = true;
 	}
 
 	/**
@@ -61,6 +69,35 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 		array $urls, int $retries, $logger, CloudflarePurgeBudget $budget
 	) {
 		return static::sendChunk( $urls, 'zone-id', [], $retries, $logger, $budget );
+	}
+
+	/**
+	 * @param string[][] $chunks
+	 * @param int $retries
+	 * @param CloudflarePurgeArrayLogger $logger
+	 * @param CloudflarePurgeBudget $budget
+	 * @return bool
+	 */
+	public static function runChunks(
+		array $chunks, int $retries, $logger, CloudflarePurgeBudget $budget
+	) {
+		return static::sendChunks(
+			$chunks, 'zone-id', [], $retries, $logger, $budget,
+			array_sum( array_map( 'count', $chunks ) )
+		);
+	}
+
+	/**
+	 * Stands in for the JobQueueGroup hand-over, which is the one part of the
+	 * deferral that needs MediaWiki.
+	 *
+	 * @param string[] $urls
+	 * @return bool
+	 */
+	protected static function deferUrls( array $urls ) {
+		self::$deferred = $urls;
+
+		return self::$deferSucceeds;
 	}
 
 	/**
