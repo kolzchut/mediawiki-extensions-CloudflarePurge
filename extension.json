@@ -18,6 +18,7 @@
 	"AutoloadClasses": {
 		"CloudflarePurge": "CloudflarePurge.php",
 		"CloudflarePurgeRelayer": "includes/CloudflarePurgeRelayer.php",
+		"CloudflarePurgeRetryPolicy": "includes/CloudflarePurgeRetryPolicy.php",
 		"CloudflarePurgeUrlSet": "includes/CloudflarePurgeUrlSet.php"
 	},
 	"TestAutoloadClasses": {

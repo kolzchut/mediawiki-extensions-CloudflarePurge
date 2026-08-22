@@ -6,8 +6,11 @@ use MediaWiki\Title\Title;
 
 class CloudflarePurge {
 
-	/** @var int Milliseconds to wait before the first retry; doubled each attempt */
-	private const RETRY_BASE_DELAY_MS = 250;
+	/** @var int Seconds to wait for the TCP/TLS connection to Cloudflare */
+	private const CONNECT_TIMEOUT_SECONDS = 5;
+
+	/** @var int Seconds to wait for the whole request, connection included */
+	private const TOTAL_TIMEOUT_SECONDS = 15;
 
 	/**
 	 * Subscribe to MediaWiki's own CDN purge stream unless the wiki has
@@ -186,19 +189,32 @@ class CloudflarePurge {
 	) {
 		$attempt = 0;
 		while ( true ) {
-			[ $status, $error ] = self::request( $urls, $zoneID, $headers );
-			if ( $status === true ) {
+			$result = self::request( $urls, $zoneID, $headers );
+			if ( $result['ok'] ) {
 				return true;
 			}
 
-			$retryable = ( $status === null || $status === 429 || $status >= 500 );
-			if ( !$retryable || $attempt >= $retries ) {
+			$permanent = $result['status'] === null
+				? CloudflarePurgeRetryPolicy::permanentTransportReason( $result['curlErrno'] )
+				: null;
+			$delay = CloudflarePurgeRetryPolicy::retryDelaySeconds(
+				$attempt,
+				$retries,
+				$result['status'],
+				$result['curlErrno'],
+				$result['retryAfter']
+			);
+
+			if ( $delay === null ) {
 				$logger->error(
 					'Cloudflare purge failed for {count} URLs: {error}',
 					[
 						'count' => count( $urls ),
-						'error' => $error,
-						'httpStatus' => $status,
+						'error' => $result['error'],
+						'httpStatus' => $result['status'],
+						'curlErrno' => $result['curlErrno'],
+						'permanent' => $permanent,
+						'retryAfter' => $result['retryAfter'],
 						'attempts' => $attempt + 1,
 						'firstUrl' => $urls[0] ?? '',
 					]
@@ -207,22 +223,37 @@ class CloudflarePurge {
 			}
 
 			$logger->warning(
-				'Cloudflare purge attempt {attempt} failed, retrying: {error}',
-				[ 'attempt' => $attempt + 1, 'error' => $error, 'httpStatus' => $status ]
+				'Cloudflare purge attempt {attempt} failed, retrying in {delay}s: {error}',
+				[
+					'attempt' => $attempt + 1,
+					'delay' => $delay,
+					'error' => $result['error'],
+					'httpStatus' => $result['status'],
+				]
 			);
-			usleep( self::RETRY_BASE_DELAY_MS * 1000 * ( 2 ** $attempt ) );
+			usleep( (int)round( $delay * 1000000 ) );
 			$attempt++;
 		}
 	}
 
 	/**
+	 * Send one chunk to Cloudflare.
+	 *
+	 * The timeouts are load-bearing, not defensive tidiness. cURL defaults to
+	 * a 300-second connect timeout and no total timeout at all, and this code
+	 * now runs on a pre-send deferred update — a blackholed api.cloudflare.com
+	 * (dropped SYNs rather than a refusal) would hold the editor's save open
+	 * for minutes, and wedge a job runner's whole loop.
+	 *
 	 * @param string[] $urls
 	 * @param string $zoneID
 	 * @param string[] $headers
-	 * @return array{0:true|int|null,1:string} true on success, otherwise the
-	 *   HTTP status (or null for a transport-level failure) and a message
+	 * @return array{ok:bool,status:int|null,error:string,curlErrno:int,retryAfter:float|null}
+	 *   'status' is the HTTP status, or null for a transport-level failure
 	 */
 	private static function request( array $urls, string $zoneID, array $headers ) {
+		$retryAfter = null;
+
 		$curl = curl_init();
 		curl_setopt( $curl, CURLOPT_URL,
 			'https://api.cloudflare.com/client/v4/zones/' . $zoneID . '/purge_cache' );
@@ -230,22 +261,55 @@ class CloudflarePurge {
 		curl_setopt( $curl, CURLOPT_POST, true );
 		curl_setopt( $curl, CURLOPT_POSTFIELDS, json_encode( [ 'files' => $urls ] ) );
 		curl_setopt( $curl, CURLOPT_HTTPHEADER, $headers );
+		curl_setopt( $curl, CURLOPT_CONNECTTIMEOUT, self::CONNECT_TIMEOUT_SECONDS );
+		curl_setopt( $curl, CURLOPT_TIMEOUT, self::TOTAL_TIMEOUT_SECONDS );
+		curl_setopt( $curl, CURLOPT_HEADERFUNCTION,
+			static function ( $handle, $header ) use ( &$retryAfter ) {
+				$parts = explode( ':', $header, 2 );
+				if ( count( $parts ) === 2
+					&& strcasecmp( trim( $parts[0] ), 'Retry-After' ) === 0
+					&& is_numeric( trim( $parts[1] ) )
+				) {
+					$retryAfter = (float)trim( $parts[1] );
+				}
+				return strlen( $header );
+			}
+		);
 
 		$response = curl_exec( $curl );
 		$httpStatus = (int)curl_getinfo( $curl, CURLINFO_RESPONSE_CODE );
+		$curlErrno = curl_errno( $curl );
 		$curlError = curl_error( $curl );
 
 		if ( $response === false ) {
-			return [ null, $curlError ?: 'transport failure' ];
+			return [
+				'ok' => false,
+				'status' => null,
+				'error' => $curlError ?: 'transport failure',
+				'curlErrno' => $curlErrno,
+				'retryAfter' => $retryAfter,
+			];
 		}
 
 		$result = json_decode( $response, true );
 		if ( !is_array( $result ) || !isset( $result['success'] ) ) {
-			return [ $httpStatus ?: null, 'invalid response from Cloudflare API' ];
+			return [
+				'ok' => false,
+				'status' => $httpStatus ?: null,
+				'error' => 'invalid response from Cloudflare API',
+				'curlErrno' => $curlErrno,
+				'retryAfter' => $retryAfter,
+			];
 		}
 
 		if ( $result['success'] ) {
-			return [ true, '' ];
+			return [
+				'ok' => true,
+				'status' => $httpStatus,
+				'error' => '',
+				'curlErrno' => 0,
+				'retryAfter' => null,
+			];
 		}
 
 		$messages = [];
@@ -255,6 +319,12 @@ class CloudflarePurge {
 			}
 		}
 
-		return [ $httpStatus ?: null, $messages ? implode( ', ', $messages ) : 'unknown error' ];
+		return [
+			'ok' => false,
+			'status' => $httpStatus ?: null,
+			'error' => $messages ? implode( ', ', $messages ) : 'unknown error',
+			'curlErrno' => $curlErrno,
+			'retryAfter' => $retryAfter,
+		];
 	}
 }

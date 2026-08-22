@@ -7,7 +7,10 @@ use PHPUnit\Framework\TestCase;
  */
 class CloudflarePurgeRegistrationTest extends TestCase {
 
-	/** @var array */
+	/** @var bool */
+	private $savedRelayersSet;
+
+	/** @var array|null */
 	private $savedRelayers;
 
 	/** @var bool */
@@ -18,6 +21,7 @@ class CloudflarePurgeRegistrationTest extends TestCase {
 
 	protected function setUp(): void {
 		parent::setUp();
+		$this->savedRelayersSet = array_key_exists( 'wgEventRelayerConfig', $GLOBALS );
 		$this->savedRelayers = $GLOBALS['wgEventRelayerConfig'] ?? null;
 		$this->savedFlagSet = array_key_exists( 'wgCloudflarePurgeUseCdnRelay', $GLOBALS );
 		$this->savedFlag = $GLOBALS['wgCloudflarePurgeUseCdnRelay'] ?? null;
@@ -25,10 +29,12 @@ class CloudflarePurgeRegistrationTest extends TestCase {
 	}
 
 	protected function tearDown(): void {
-		if ( $this->savedRelayers === null ) {
-			unset( $GLOBALS['wgEventRelayerConfig'] );
-		} else {
+		if ( $this->savedRelayersSet ) {
 			$GLOBALS['wgEventRelayerConfig'] = $this->savedRelayers;
+		} else {
+			// Restore "absent", not "present and null" — a global set to null
+			// is not the same state a wiki without the setting is in.
+			unset( $GLOBALS['wgEventRelayerConfig'] );
 		}
 		if ( $this->savedFlagSet ) {
 			$GLOBALS['wgCloudflarePurgeUseCdnRelay'] = $this->savedFlag;

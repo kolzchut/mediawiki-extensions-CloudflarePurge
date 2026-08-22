@@ -19,18 +19,17 @@ use Wikimedia\EventRelayer\EventRelayer;
 class CloudflarePurgeRelayer extends EventRelayer {
 
 	/**
+	 * The return value is reported for completeness only: the sole caller,
+	 * CdnCacheUpdate::purge(), discards it. The log line
+	 * CloudflarePurge::purgeUrls() writes is therefore the only signal that a
+	 * purge failed, which is why the 'CloudflarePurge' channel has to be
+	 * routed somewhere on the wiki (see README, "Failure behaviour").
+	 *
 	 * @param string $channel
 	 * @param array[] $events List of [ 'url' => string, 'timestamp' => float ]
 	 * @return bool
 	 */
 	protected function doNotify( $channel, array $events ) {
-		$urls = [];
-		foreach ( $events as $event ) {
-			if ( isset( $event['url'] ) && is_string( $event['url'] ) ) {
-				$urls[] = $event['url'];
-			}
-		}
-
-		return CloudflarePurge::purgeUrls( $urls );
+		return CloudflarePurge::purgeUrls( CloudflarePurgeUrlSet::urlsFromEvents( $events ) );
 	}
 }

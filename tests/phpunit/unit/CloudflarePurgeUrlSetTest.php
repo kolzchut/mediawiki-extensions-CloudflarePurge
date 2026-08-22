@@ -141,4 +141,35 @@ class CloudflarePurgeUrlSetTest extends TestCase {
 		$this->assertTrue( $set->isEmpty() );
 		$this->assertSame( [], $set->getChunks() );
 	}
+
+	/**
+	 * The payload MediaWiki broadcasts on 'cdn-url-purges' is a list of
+	 * [ 'url' => ..., 'timestamp' => ... ] maps; the relayer forwards exactly
+	 * the URLs out of it.
+	 */
+	public function testUrlsAreExtractedFromPurgeEvents() {
+		$urls = CloudflarePurgeUrlSet::urlsFromEvents( [
+			[ 'url' => 'https://example.org/wiki/A', 'timestamp' => 1.0 ],
+			[ 'url' => 'https://example.org/wiki/B', 'timestamp' => 1.0 ],
+		] );
+
+		$this->assertSame(
+			[ 'https://example.org/wiki/A', 'https://example.org/wiki/B' ],
+			$urls
+		);
+	}
+
+	/**
+	 * A malformed event must not take the rest of the batch down with it.
+	 */
+	public function testMalformedPurgeEventsAreSkipped() {
+		$urls = CloudflarePurgeUrlSet::urlsFromEvents( [
+			[ 'timestamp' => 1.0 ],
+			[ 'url' => [ 'not', 'a', 'string' ] ],
+			'not an event',
+			[ 'url' => 'https://example.org/wiki/Good' ],
+		] );
+
+		$this->assertSame( [ 'https://example.org/wiki/Good' ], $urls );
+	}
 }

@@ -13,17 +13,22 @@ class CloudflarePurgeUrlSet {
 	/**
 	 * Hard ceiling on the URLs one purge call may send.
 	 *
-	 * MediaWiki hands us at most $wgUpdateRowsPerJob (300) pages per
-	 * HTMLCacheUpdateJob, one URL each, multiplied by (1 + extra hosts). The
-	 * default therefore never binds in normal operation; it exists to clamp a
-	 * pathological caller (a maintenance script, a raised $wgUpdateRowsPerJob)
-	 * rather than to shape ordinary traffic.
+	 * MediaWiki hands us at most $wgUpdateRowsPerQuery (100) pages per leaf
+	 * HTMLCacheUpdateJob — $wgUpdateRowsPerJob (300) is the partition *range*
+	 * BacklinkJobUtils::partitionBacklinkJob() covers, not the number of
+	 * titles a leaf job carries — one URL each, multiplied by (1 + extra
+	 * hosts). With one extra host that is 200 URLs. The default therefore
+	 * never binds in normal operation; it exists to clamp a pathological
+	 * caller (a maintenance script, a raised $wgUpdateRowsPerQuery) rather
+	 * than to shape ordinary traffic.
 	 */
 	public const DEFAULT_MAX_URLS = 1000;
 
 	/**
 	 * URLs per API request. Cloudflare caps single-file purge at 100
-	 * operations per request on Free/Pro/Business (500 on Enterprise).
+	 * operations per request on Free/Pro/Business; the 500 figure applies to
+	 * Enterprise single-file purge only — purge by hostname, tag or prefix is
+	 * capped at 100 per request on every plan.
 	 */
 	public const DEFAULT_URLS_PER_REQUEST = 100;
 
@@ -45,6 +50,26 @@ class CloudflarePurgeUrlSet {
 		$this->chunks = $chunks;
 		$this->count = $count;
 		$this->dropped = $dropped;
+	}
+
+	/**
+	 * Pull the URLs out of a batch of 'cdn-url-purges' events.
+	 *
+	 * Kept here, next to the rest of the URL handling, so the shape of the
+	 * event payload MediaWiki broadcasts can be asserted without a wiki.
+	 *
+	 * @param array[] $events List of [ 'url' => string, 'timestamp' => float ]
+	 * @return string[]
+	 */
+	public static function urlsFromEvents( array $events ): array {
+		$urls = [];
+		foreach ( $events as $event ) {
+			if ( is_array( $event ) && isset( $event['url'] ) && is_string( $event['url'] ) ) {
+				$urls[] = $event['url'];
+			}
+		}
+
+		return $urls;
 	}
 
 	/**

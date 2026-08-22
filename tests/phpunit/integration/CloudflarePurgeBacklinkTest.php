@@ -4,12 +4,25 @@ use MediaWiki\MainConfigNames;
 use MediaWiki\Title\Title;
 
 /**
- * The behaviour this extension exists for: an edit must invalidate the pages
- * that *show* the edited content, not just the page that was edited.
+ * An upgrade canary on the assumption this extension is built from, not a test
+ * of the extension.
+ *
+ * CloudflarePurgeRelayer does no backlink walking of its own: it relies on
+ * MediaWiki queueing HTMLCacheUpdateJob for an edited page's backlinks and
+ * broadcasting the resulting URLs on the 'cdn-url-purges' channel. If a future
+ * MediaWiki release stops doing that — or narrows what it broadcasts — this
+ * extension quietly stops purging anything but the edited page, with no error
+ * anywhere.
+ *
+ * These tests therefore assert *core's* behaviour, through a capturing relayer
+ * subscribed to the same channel. They deliberately do not exercise
+ * CloudflarePurgeRelayer or CloudflarePurge: reaching those would mean issuing
+ * a real purge against a real Cloudflare zone. The extension's own logic is
+ * covered by the unit tests (CloudflarePurgeUrlSet, CloudflarePurgeRetryPolicy,
+ * CloudflarePurge::onRegistration).
  *
  * @group Database
- * @covers CloudflarePurgeRelayer
- * @covers CloudflarePurge
+ * @coversNothing
  */
 class CloudflarePurgeBacklinkTest extends MediaWikiIntegrationTestCase {
 
@@ -33,7 +46,7 @@ class CloudflarePurgeBacklinkTest extends MediaWikiIntegrationTestCase {
 		return Title::newFromText( $titleText )->getInternalURL();
 	}
 
-	public function testEditingATemplatePurgesThePagesThatTranscludeIt() {
+	public function testEditingATemplateBroadcastsThePagesThatTranscludeIt() {
 		$this->editPage( 'Template:BenefitAmount', '1,234 NIS' );
 		$this->editPage( 'Unemployment benefit', 'Amount: {{BenefitAmount}}' );
 		$this->editPage( 'Disability benefit', 'Amount: {{BenefitAmount}}' );
@@ -49,7 +62,7 @@ class CloudflarePurgeBacklinkTest extends MediaWikiIntegrationTestCase {
 		$this->assertContains( $this->urlFor( 'Template:BenefitAmount' ), $purged );
 	}
 
-	public function testEditingAPageWithNoBacklinksPurgesOnlyItself() {
+	public function testEditingAPageWithNoBacklinksBroadcastsOnlyItself() {
 		$this->editPage( 'Template:BenefitAmount', '1,234 NIS' );
 		$this->editPage( 'Unemployment benefit', 'Amount: {{BenefitAmount}}' );
 		$this->editPage( 'Standalone page', 'Nothing transcludes this.' );
@@ -63,23 +76,5 @@ class CloudflarePurgeBacklinkTest extends MediaWikiIntegrationTestCase {
 		$this->assertContains( $this->urlFor( 'Standalone page' ), $purged );
 		$this->assertNotContains( $this->urlFor( 'Unemployment benefit' ), $purged );
 		$this->assertNotContains( $this->urlFor( 'Template:BenefitAmount' ), $purged );
-	}
-
-	/**
-	 * The relayer is what turns that broadcast into a Cloudflare call, so the
-	 * extension must actually claim the channel when it loads.
-	 */
-	public function testExtensionClaimsTheCdnPurgeChannelByDefault() {
-		$globals = $GLOBALS;
-		unset( $GLOBALS['wgEventRelayerConfig'], $GLOBALS['wgCloudflarePurgeUseCdnRelay'] );
-		try {
-			CloudflarePurge::onRegistration();
-			$this->assertSame(
-				CloudflarePurgeRelayer::class,
-				$GLOBALS['wgEventRelayerConfig']['cdn-url-purges']['class']
-			);
-		} finally {
-			$GLOBALS['wgEventRelayerConfig'] = $globals['wgEventRelayerConfig'] ?? null;
-		}
 	}
 }
