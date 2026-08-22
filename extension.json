@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "CloudflarePurge",
-	"version": "1.2",
+	"version": "1.3",
 	"url": "https://www.mediawiki.org/wiki/Extension:CloudflarePurge",
 	"author": "[https://www.mediawiki.org/wiki/User:Sophivorus Sophivorus]",
 	"descriptionmsg": "cloudflarepurge-desc",
@@ -17,12 +17,16 @@
 	},
 	"AutoloadClasses": {
 		"CloudflarePurge": "CloudflarePurge.php",
+		"CloudflarePurgeBudget": "includes/CloudflarePurgeBudget.php",
 		"CloudflarePurgeRelayer": "includes/CloudflarePurgeRelayer.php",
 		"CloudflarePurgeRetryPolicy": "includes/CloudflarePurgeRetryPolicy.php",
 		"CloudflarePurgeUrlSet": "includes/CloudflarePurgeUrlSet.php"
 	},
 	"TestAutoloadClasses": {
-		"CloudflarePurgeCapturingRelayer": "tests/phpunit/integration/CloudflarePurgeCapturingRelayer.php"
+		"CloudflarePurgeArrayLogger": "tests/phpunit/unit/CloudflarePurgeArrayLogger.php",
+		"CloudflarePurgeCapturingRelayer": "tests/phpunit/integration/CloudflarePurgeCapturingRelayer.php",
+		"CloudflarePurgeLadderProbe": "tests/phpunit/unit/CloudflarePurgeLadderProbe.php",
+		"CloudflarePurgeSocketProbe": "tests/phpunit/unit/CloudflarePurgeSocketProbe.php"
 	},
 	"Hooks": {
 		"PageSaveComplete": "CloudflarePurge::onPageSaveComplete",
@@ -56,6 +60,10 @@
 		},
 		"CloudflarePurgeMaxRetries": {
 			"value": 2
+		},
+		"CloudflarePurgePreSendBudgetSeconds": {
+			"value": 5,
+			"description": "Wall-clock seconds one purge call may spend when it runs before the response is flushed, so that a Cloudflare outage cannot stall every editor's save at once. Applies only on that path — CLI and post-send job purges are never clipped. Set to 0 to remove the bound."
 		}
 	},
 	"callback": "CloudflarePurge::onRegistration"

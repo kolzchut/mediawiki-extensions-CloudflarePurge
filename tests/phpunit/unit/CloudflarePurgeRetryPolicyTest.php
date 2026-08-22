@@ -17,21 +17,133 @@ class CloudflarePurgeRetryPolicyTest extends TestCase {
 	}
 
 	/**
-	 * An unresolvable host or a rejected certificate cannot be fixed by
-	 * waiting, and retrying it multiplies the delay on a path where an editor
-	 * is waiting for their save.
+	 * A rejected certificate cannot be fixed by waiting, and retrying it
+	 * multiplies the delay on a path where an editor is waiting for their save.
 	 */
 	public function testPermanentTransportFailureIsNotRetried() {
-		// 6 = CURLE_COULDNT_RESOLVE_HOST
-		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 6 ) );
 		// 60 = CURLE_SSL_CACERT
 		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 60 ) );
+		// 3 = CURLE_URL_MALFORMAT
+		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 3 ) );
 
+		// 60 is peer-certificate verification; CURLE_SSL_CACERT (51) is its
+		// obsolete alias, not the other way round.
 		$this->assertSame(
-			'could not resolve host',
-			CloudflarePurgeRetryPolicy::permanentTransportReason( 6 )
+			'TLS peer certificate verification failed',
+			CloudflarePurgeRetryPolicy::permanentTransportReason( 60 )
 		);
 		$this->assertNull( CloudflarePurgeRetryPolicy::permanentTransportReason( 28 ) );
+	}
+
+	/**
+	 * The regression this class was changed for.
+	 *
+	 * libcurl reports every resolver failure as errno 6 — a SERVFAIL, a
+	 * resolver timeout, a cycling Docker embedded DNS — not only a name that
+	 * does not exist. Classifying it permanent abandoned the purge on the
+	 * first attempt during a sub-second DNS blip, and nothing retries a
+	 * dropped purge: purgeUrls() does not throw, CdnCacheUpdate::purge()
+	 * discards its return value, and the page_touched bump makes a job re-run
+	 * a no-op. The page then serves stale from the edge for a full TTL.
+	 */
+	public function testAResolverFailureIsRetried() {
+		// 6 = CURLE_COULDNT_RESOLVE_HOST
+		$this->assertSame( 0.25, CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 6 ) );
+		$this->assertSame( 0.5, CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6 ) );
+
+		$this->assertNull( CloudflarePurgeRetryPolicy::permanentTransportReason( 6 ) );
+		$this->assertSame(
+			'could not resolve host',
+			CloudflarePurgeRetryPolicy::fastRetryTransportReason( 6 )
+		);
+	}
+
+	/**
+	 * The cap reaches exactly as far as its justification does.
+	 *
+	 * "A full ladder would spend the whole time budget" is only an argument
+	 * where there is a budget. On the job-queue path there is none, nobody is
+	 * waiting, and that path carries the backlink fan-out — the larger and
+	 * more valuable URL set. Capping it there would drop that set to save
+	 * nothing.
+	 */
+	public function testTheFastRetryCapAppliesOnlyWhereTimeIsBounded() {
+		// Time-bounded: one retry, then stop.
+		$this->assertSame(
+			0.25,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 6, null, true )
+		);
+		$this->assertNull(
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6, null, true )
+		);
+
+		// Unbounded: the configured ladder, same as any other transient failure.
+		$this->assertSame(
+			0.5,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6, null, false )
+		);
+		$this->assertSame(
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 28, null, false ),
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, 6, null, false )
+		);
+	}
+
+	/**
+	 * 5 is the same argument for a proxied install, and 35 is libcurl's
+	 * catch-all for "the handshake went wrong" — which covers a mid-handshake
+	 * reset or an edge node cycling as readily as a real misconfiguration.
+	 * The genuinely permanent TLS errors are 51/58/59/60/77/83.
+	 */
+	public function testProxyResolutionAndHandshakeFailuresAreRetriedToo() {
+		// 5 = CURLE_COULDNT_RESOLVE_PROXY, 35 = CURLE_SSL_CONNECT_ERROR
+		foreach ( [ 5, 35 ] as $errno ) {
+			$this->assertNull(
+				CloudflarePurgeRetryPolicy::permanentTransportReason( $errno ),
+				"errno $errno must not be permanent"
+			);
+			$this->assertSame(
+				0.25,
+				CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, $errno, null, true )
+			);
+			$this->assertNull(
+				CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, $errno, null, true )
+			);
+			$this->assertSame(
+				0.5,
+				CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 2, null, $errno, null, false )
+			);
+		}
+	}
+
+	/**
+	 * A fast retry is one retry whatever $wgCloudflarePurgeMaxRetries says: on
+	 * a resolver that is genuinely down, a full ladder spends the whole
+	 * pre-send budget re-asking it.
+	 */
+	public function testTheFastRetryCapIsNotRaisedByMaxRetries() {
+		$this->assertSame(
+			0.25,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 9, null, 6, null, true )
+		);
+		$this->assertNull(
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 9, null, 6, null, true )
+		);
+		// ...while an ordinary transient failure still gets the configured ladder.
+		$this->assertSame(
+			0.5,
+			CloudflarePurgeRetryPolicy::retryDelaySeconds( 1, 9, null, 28, null, true )
+		);
+	}
+
+	/**
+	 * A dropped purge is invisible to everything upstream, so the class it was
+	 * dropped under has to reach the log.
+	 */
+	public function testTransportFailuresAreClassifiedForTheLog() {
+		$this->assertSame( 'permanent', CloudflarePurgeRetryPolicy::transportFailureClass( 60 ) );
+		$this->assertSame( 'fast-retry', CloudflarePurgeRetryPolicy::transportFailureClass( 6 ) );
+		$this->assertSame( 'transient', CloudflarePurgeRetryPolicy::transportFailureClass( 28 ) );
+		$this->assertSame( 'transient', CloudflarePurgeRetryPolicy::transportFailureClass( 0 ) );
 	}
 
 	public function testServerErrorsAreRetriedAndClientErrorsAreNot() {
