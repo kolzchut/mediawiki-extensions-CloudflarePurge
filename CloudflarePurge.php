@@ -13,6 +13,38 @@ class CloudflarePurge {
 	private const TOTAL_TIMEOUT_SECONDS = 15;
 
 	/**
+	 * Cloudflare's purge endpoint, as a sprintf pattern over the zone ID.
+	 *
+	 * Behind a method rather than inline so a test can point the real request
+	 * path — timeouts, retry ladder and all — at a socket it controls. See
+	 * the note on request().
+	 *
+	 * @param string $zoneID
+	 * @return string
+	 */
+	protected static function endpointUrl( string $zoneID ): string {
+		return 'https://api.cloudflare.com/client/v4/zones/' . $zoneID . '/purge_cache';
+	}
+
+	/**
+	 * Current wall-clock time. A seam: the retry ladder is a sequence of
+	 * waits, and a test that had to sit through them in real time would take
+	 * 45 seconds to assert one chunk's worst case.
+	 *
+	 * @return float
+	 */
+	protected static function now(): float {
+		return microtime( true );
+	}
+
+	/**
+	 * @param float $seconds
+	 */
+	protected static function sleepSeconds( float $seconds ) {
+		usleep( (int)round( $seconds * 1000000 ) );
+	}
+
+	/**
 	 * Subscribe to MediaWiki's own CDN purge stream unless the wiki has
 	 * already claimed that channel or has opted out.
 	 *
@@ -168,12 +200,83 @@ class CloudflarePurge {
 		);
 
 		$retries = max( 0, (int)$config->get( 'CloudflarePurgeMaxRetries' ) );
+		$budget = self::budgetForThisCall(
+			(float)$config->get( 'CloudflarePurgePreSendBudgetSeconds' )
+		);
+
 		$ok = true;
+		$attempted = 0;
+		$i = 0;
 		foreach ( $chunks as $chunk ) {
-			$ok = self::sendChunk( $chunk, $zoneID, $headers, $retries, $logger ) && $ok;
+			if ( $budget->isExhausted( static::now() ) ) {
+				// Everything from here on stays stale until its TTL expires,
+				// which is exactly the failure this extension exists to
+				// prevent. Say so at error level, with the numbers.
+				$unsent = array_sum( array_map( 'count', array_slice( $chunks, $i ) ) );
+				$logger->error(
+					'Cloudflare purge abandoned after time budget: {unsent} of {total} URLs not purged',
+					[
+						'unsent' => $unsent,
+						'total' => $set->getUrlCount(),
+						'attempted' => $attempted,
+						'requestsDone' => $i,
+						'requestsTotal' => count( $chunks ),
+						'budget' => (float)$config->get( 'CloudflarePurgePreSendBudgetSeconds' ),
+						'firstUrl' => $chunk[0] ?? '',
+					]
+				);
+				return false;
+			}
+			$ok = static::sendChunk( $chunk, $zoneID, $headers, $retries, $logger, $budget ) && $ok;
+			$attempted += count( $chunk );
+			$i++;
 		}
 
 		return $ok;
+	}
+
+	/**
+	 * The wall-clock budget this call gets.
+	 *
+	 * The budget exists for one situation: a purge running in a *pre-send*
+	 * deferred update, where the editor's save is not flushed until the purge
+	 * returns and no timeout in the stack will end it (PHP's
+	 * max_execution_time is a CPU-time timer and does not tick during a
+	 * blocking curl or usleep; $wgRequestTimeLimit only becomes a wall-clock
+	 * limit when the Excimer extension is installed). Left unbounded, a
+	 * Cloudflare outage stalls every concurrent save at once, each holding a
+	 * worker, until the web server's read timeout returns a gateway error for
+	 * a save that in fact succeeded.
+	 *
+	 * It must NOT apply to the job-queue path, which carries the backlink
+	 * fan-out — up to $wgUpdateRowsPerQuery pages per leaf job, and many jobs
+	 * for a widely transcluded template. Nobody is waiting on those, and
+	 * clipping them would trade a bounded editor stall for exactly the stale
+	 * pages this extension exists to prevent.
+	 *
+	 * Two conditions separate the two, and both are needed. Not being in CLI
+	 * rules out the dedicated job runner. Headers not yet sent rules out
+	 * post-send work inside a web request — $wgJobRunRate defaults to 1, so a
+	 * web request may run a job after its response is flushed, and that job's
+	 * purge deserves the full ladder. Core makes the same distinction the
+	 * same way (DeferredUpdates::doUpdates() tests !headers_sent() to decide
+	 * whether a PRESEND update can still affect the response).
+	 *
+	 * @param float $seconds Configured budget; 0 or less disables it
+	 * @return CloudflarePurgeBudget
+	 */
+	private static function budgetForThisCall( float $seconds ): CloudflarePurgeBudget {
+		if ( $seconds <= 0 ) {
+			return CloudflarePurgeBudget::unlimited();
+		}
+		if ( defined( 'MW_ENTRY_POINT' ) && MW_ENTRY_POINT === 'cli' ) {
+			return CloudflarePurgeBudget::unlimited();
+		}
+		if ( headers_sent() ) {
+			return CloudflarePurgeBudget::unlimited();
+		}
+
+		return CloudflarePurgeBudget::startingAt( $seconds, static::now() );
 	}
 
 	/**
@@ -182,20 +285,32 @@ class CloudflarePurge {
 	 * @param string[] $headers
 	 * @param int $retries
 	 * @param Psr\Log\LoggerInterface $logger
+	 * @param CloudflarePurgeBudget $budget Wall-clock deadline for the whole call
 	 * @return bool
 	 */
-	private static function sendChunk(
-		array $urls, string $zoneID, array $headers, int $retries, $logger
+	protected static function sendChunk(
+		array $urls, string $zoneID, array $headers, int $retries, $logger,
+		CloudflarePurgeBudget $budget
 	) {
 		$attempt = 0;
 		while ( true ) {
-			$result = self::request( $urls, $zoneID, $headers );
+			$now = static::now();
+			// Clamp the per-attempt timeouts to what is left, so the deadline
+			// is a real bound and not one checked only between attempts: an
+			// unclamped attempt can overrun it by TOTAL_TIMEOUT_SECONDS.
+			$result = static::request(
+				$urls,
+				$zoneID,
+				$headers,
+				$budget->clampTimeout( self::CONNECT_TIMEOUT_SECONDS, $now ),
+				$budget->clampTimeout( self::TOTAL_TIMEOUT_SECONDS, $now )
+			);
 			if ( $result['ok'] ) {
 				return true;
 			}
 
-			$permanent = $result['status'] === null
-				? CloudflarePurgeRetryPolicy::permanentTransportReason( $result['curlErrno'] )
+			$transport = $result['status'] === null
+				? CloudflarePurgeRetryPolicy::transportFailureClass( $result['curlErrno'] )
 				: null;
 			$delay = CloudflarePurgeRetryPolicy::retryDelaySeconds(
 				$attempt,
@@ -205,7 +320,10 @@ class CloudflarePurge {
 				$result['retryAfter']
 			);
 
-			if ( $delay === null ) {
+			$outOfTime = $delay !== null
+				&& !$budget->permitsSleep( $delay, static::now() );
+
+			if ( $delay === null || $outOfTime ) {
 				$logger->error(
 					'Cloudflare purge failed for {count} URLs: {error}',
 					[
@@ -213,7 +331,8 @@ class CloudflarePurge {
 						'error' => $result['error'],
 						'httpStatus' => $result['status'],
 						'curlErrno' => $result['curlErrno'],
-						'permanent' => $permanent,
+						'transport' => $transport,
+						'outOfTime' => $outOfTime,
 						'retryAfter' => $result['retryAfter'],
 						'attempts' => $attempt + 1,
 						'firstUrl' => $urls[0] ?? '',
@@ -231,7 +350,7 @@ class CloudflarePurge {
 					'httpStatus' => $result['status'],
 				]
 			);
-			usleep( (int)round( $delay * 1000000 ) );
+			static::sleepSeconds( $delay );
 			$attempt++;
 		}
 	}
@@ -243,26 +362,37 @@ class CloudflarePurge {
 	 * a 300-second connect timeout and no total timeout at all, and this code
 	 * now runs on a pre-send deferred update — a blackholed api.cloudflare.com
 	 * (dropped SYNs rather than a refusal) would hold the editor's save open
-	 * for minutes, and wedge a job runner's whole loop.
+	 * for minutes, and wedge a job runner's whole loop. They arrive already
+	 * clamped to whatever is left of the call's wall-clock budget, because
+	 * bounding one attempt is not the same as bounding the ladder.
+	 *
+	 * Overridable so a test can drive the real ladder — real curl, real
+	 * timeouts, real clock — against a socket that accepts and never answers,
+	 * which is the only way to show that the deadline is what stops it.
 	 *
 	 * @param string[] $urls
 	 * @param string $zoneID
 	 * @param string[] $headers
+	 * @param float $connectTimeout Seconds, already clamped to the budget
+	 * @param float $totalTimeout Seconds, already clamped to the budget
 	 * @return array{ok:bool,status:int|null,error:string,curlErrno:int,retryAfter:float|null}
 	 *   'status' is the HTTP status, or null for a transport-level failure
 	 */
-	private static function request( array $urls, string $zoneID, array $headers ) {
+	protected static function request(
+		array $urls, string $zoneID, array $headers,
+		float $connectTimeout, float $totalTimeout
+	) {
 		$retryAfter = null;
 
 		$curl = curl_init();
-		curl_setopt( $curl, CURLOPT_URL,
-			'https://api.cloudflare.com/client/v4/zones/' . $zoneID . '/purge_cache' );
+		curl_setopt( $curl, CURLOPT_URL, static::endpointUrl( $zoneID ) );
 		curl_setopt( $curl, CURLOPT_RETURNTRANSFER, 1 );
 		curl_setopt( $curl, CURLOPT_POST, true );
 		curl_setopt( $curl, CURLOPT_POSTFIELDS, json_encode( [ 'files' => $urls ] ) );
 		curl_setopt( $curl, CURLOPT_HTTPHEADER, $headers );
-		curl_setopt( $curl, CURLOPT_CONNECTTIMEOUT, self::CONNECT_TIMEOUT_SECONDS );
-		curl_setopt( $curl, CURLOPT_TIMEOUT, self::TOTAL_TIMEOUT_SECONDS );
+		// The _MS variants because a clamped timeout is routinely fractional.
+		curl_setopt( $curl, CURLOPT_CONNECTTIMEOUT_MS, (int)round( $connectTimeout * 1000 ) );
+		curl_setopt( $curl, CURLOPT_TIMEOUT_MS, (int)round( $totalTimeout * 1000 ) );
 		curl_setopt( $curl, CURLOPT_HEADERFUNCTION,
 			static function ( $handle, $header ) use ( &$retryAfter ) {
 				$parts = explode( ':', $header, 2 );

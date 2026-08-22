@@ -45,6 +45,7 @@ edited page itself.
 | `$wgCloudflarePurgeMaxUrlsPerBatch` | int | `1000` | Ceiling on URLs per purge call; `0` disables the ceiling |
 | `$wgCloudflarePurgeUrlsPerRequest` | int | `100` | URLs per Cloudflare API request |
 | `$wgCloudflarePurgeMaxRetries` | int | `2` | Retries for a *retryable* failure: HTTP 429, 5xx, or a transport error a retry could fix |
+| `$wgCloudflarePurgePreSendBudgetSeconds` | float | `5` | Wall-clock seconds one purge call may spend *before the response is flushed*. `0` removes the bound. Never applies to CLI or post-send job purges. |
 
 ## Extra hosts
 
@@ -73,9 +74,12 @@ across every zone on the same plan tier:
   Enterprise.
 
 Requests are split at `$wgCloudflarePurgeUrlsPerRequest`. Note which limit
-binds first: at 100 URLs per request, the request rate is exhausted long
-before the URL rate on every plan, so the number of *requests* is the
-figure to watch.
+binds for *this* extension: it sends `{"files": [...]}`, i.e. single-file
+purge by URL, and Cloudflare meters that in **URLs per second**. The
+request-rate row above governs purge by hostname, tag, prefix or
+purge-everything — none of which this extension issues. So the URL rate is
+the figure to watch, and at 100 URLs per request the request count is well
+inside its own limit long before the URL rate binds.
 
 What bounds a single call is core, not this extension. Backlink purges
 arrive one leaf `HTMLCacheUpdateJob` at a time, and a leaf job carries at
@@ -120,28 +124,98 @@ somewhere real — under a `MonologSpi` with a `'@default' => null` fallback,
 an unlisted channel is silently discarded and a failed purge becomes
 invisible.
 
-Retries are deliberately narrow. HTTP 429 and 5xx are retried
+Retries are deliberately narrow, and they sort transport failures into
+three classes rather than two. HTTP 429 and 5xx are retried
 (`$wgCloudflarePurgeMaxRetries`) with a short exponential backoff, and a
 `Retry-After` on a 429 is honoured up to 5 seconds — beyond that the
-attempt is abandoned rather than slept through. Transport failures are
-retried only when a retry could plausibly help: a refused or timed-out
-connection is, an unresolvable host or a rejected TLS certificate is not,
-because those fail identically every time and only multiply the delay.
+attempt is abandoned rather than slept through.
+
+- **Permanent** (cURL 1, 3, 51, 58, 59, 60, 77, 83) — a malformed URL, a
+  certificate that does not verify. One attempt, no retry: these fail
+  identically every time.
+- **Fast-retry** (cURL 5, 6, 35) — *exactly one* retry, whatever
+  `$wgCloudflarePurgeMaxRetries` says. libcurl reports every resolver
+  failure as errno 6, not only a name that does not exist: a SERVFAIL, a
+  resolver timeout, a cycling Docker embedded DNS. Errno 35 is likewise
+  libcurl's catch-all for a handshake that went wrong, which covers a
+  mid-handshake reset. Treating these as permanent drops the purge on the
+  first attempt during a sub-second blip — and nothing retries a dropped
+  purge (see "The log line is the only signal" above). One retry recovers
+  the blip; a full ladder would spend the whole time budget re-asking a
+  resolver that is genuinely down.
+- **Transient** (everything else, e.g. 7 and 28) — the full ladder.
+
+Which class ended a failed purge is logged as `transport`.
 
 Requests carry a 5-second connect timeout and a 15-second total timeout.
-Without them cURL waits 300 seconds to connect and forever to finish,
-which on the `PageSaveComplete` path — a PRESEND deferred update, run
-before the response is flushed — would hold an editor's save open for
-minutes if `api.cloudflare.com` were blackholed, and would wedge a job
-runner's loop for that language. With them, the worst case a blackholed
-API can cost one purge call is roughly 32 seconds (2 requests × 3 attempts
-× 5s, plus backoff).
+Without them cURL waits 300 seconds to connect and forever to finish.
+
+### The pre-send time budget
+
+Per-request timeouts bound one *attempt*. They do not bound the ladder,
+and the ladder is what an editor waits for.
+
+`WikiPage::onArticleEdit()` purges the edited page with `PURGE_PRESEND`,
+which `HTMLCacheUpdater` defers at `DeferredUpdates::PRESEND` — before the
+response is flushed. Nothing in a normal stack ends a purge that overruns
+there:
+
+- PHP's `max_execution_time` is a CPU-time timer (`ITIMER_PROF`) and does
+  not tick while the process is blocked in cURL or `usleep`. Measured: a
+  script under `max_execution_time=2` ran 8 seconds of blocking cURL and
+  `usleep` and was never interrupted.
+- `$wgRequestTimeLimit` becomes a *wall-clock* limit only when the Excimer
+  extension is installed; without it `RequestTimeout` falls back to
+  `set_time_limit()`, i.e. the same CPU-time timer. It also defaults to
+  `null`, in which case the limit is never armed at all.
+- php-fpm's `request_terminate_timeout` is frequently left unset on wikis
+  with legitimately slow endpoints.
+
+So the request does not die — it **stalls**, holding a worker, until the
+web server's own read timeout hands the editor a gateway error for a save
+that in fact succeeded. During a Cloudflare outage every concurrent save
+pays that at once, and the pool saturates.
+
+Measured on the real clock against an endpoint that accepts the connection
+and then stops answering, with the budget removed: **45.76 seconds for one
+chunk** (3 attempts × 15s + 0.75s of backoff). A blackholed endpoint that
+drops SYNs costs the connect timeout instead: 15.75s per chunk. Multiply
+by the number of chunks.
+
+`$wgCloudflarePurgePreSendBudgetSeconds` (default 5) is a wall-clock
+deadline for the whole call. It clamps each attempt's cURL timeouts to
+what is left, refuses a backoff that would not leave time for the attempt
+it precedes, and stops between chunks — so the deadline is a real bound
+rather than one checked only between attempts.
+
+It applies **only** on the pre-send path. Two conditions separate that
+from everything else, and both are needed: not being in CLI (which rules
+out the dedicated job runner), and `headers_sent()` being false (which
+rules out post-send work inside a web request — `$wgJobRunRate` defaults
+to `1`, so a web request may run a job after its response is flushed).
+Core makes the same distinction the same way. The job-queue path carries
+the backlink fan-out and nobody is waiting on it; clipping it would trade
+a bounded editor stall for exactly the stale pages this extension exists
+to prevent.
+
+When the budget does stop a call, the URLs it did not reach are logged at
+error level with their count, because they will stay stale for a full TTL.
 
 ## Tests
 
 `tests/phpunit/unit` holds dependency-free tests of the fan-out
-arithmetic, the event-payload handling, the retry policy and the channel
-registration.
+arithmetic, the event-payload handling, the retry policy, the time budget
+and the channel registration.
+
+Two of them are about timing rather than arithmetic.
+`CloudflarePurgeLadderTest` drives the real retry ladder on a virtual
+clock, because reaching the un-budgeted 45.75s worst case in real time is
+what stopped anyone noticing it. `CloudflarePurgeDeadlineWallClockTest`
+then drives the real request path — real cURL, real timeouts, real clock —
+at a local socket that accepts and never answers, on two different
+budgets, to show that the clamped timeout reaches libcurl and is what ends
+the attempt. It takes a couple of seconds; with the clamp removed the same
+test takes 45.
 
 `tests/phpunit/integration` is an upgrade canary rather than a test of
 this extension: it asserts that *MediaWiki* still queues backlink jobs and
