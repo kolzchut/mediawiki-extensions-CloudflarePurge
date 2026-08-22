@@ -65,16 +65,18 @@ class CloudflarePurgeRetryPolicy {
 	 *
 	 * Numeric literals rather than the CURLE_* constants so this class stays
 	 * loadable without ext-curl; the numbers are part of libcurl's ABI and
-	 * are never reassigned. 51 is kept for completeness only — libcurl folded
-	 * it into 60 in 7.62, so it cannot fire on any currently shipping build.
+	 * are never reassigned. 51 is kept for completeness only: libcurl aliased
+	 * CURLE_SSL_CACERT to 60 in 7.62 (curl.h), so 51 cannot fire on any
+	 * currently shipping build — curl_strerror( 51 ) already returns "Unknown
+	 * error". 60 is the live code, and it is peer-certificate verification.
 	 */
 	private const PERMANENT_CURL_ERRORS = [
 		1 => 'unsupported protocol',
 		3 => 'malformed URL',
-		51 => 'TLS certificate verification failed',
+		51 => 'TLS CA certificate verification failed (obsolete alias of 60)',
 		58 => 'local TLS certificate problem',
 		59 => 'no matching TLS cipher',
-		60 => 'TLS CA certificate verification failed',
+		60 => 'TLS peer certificate verification failed',
 		77 => 'CA certificate file unreadable',
 		83 => 'TLS issuer check failed',
 	];

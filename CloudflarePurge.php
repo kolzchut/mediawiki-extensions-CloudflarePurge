@@ -12,6 +12,27 @@ class CloudflarePurge {
 	/** @var int Seconds to wait for the whole request, connection included */
 	private const TOTAL_TIMEOUT_SECONDS = 15;
 
+	/** @var string One chunk purged successfully */
+	public const CHUNK_OK = 'ok';
+
+	/**
+	 * @var string One chunk failed for a reason of its own — the retry ladder
+	 *   ran out, or the failure was one a retry cannot fix.
+	 */
+	public const CHUNK_FAILED = 'failed';
+
+	/**
+	 * @var string One chunk was cut off by the wall-clock budget rather than by
+	 *   anything about the failure itself.
+	 *
+	 * This is a distinct outcome because it needs a distinct disposition. A
+	 * chunk that failed on its merits has had every attempt it was going to
+	 * get; a chunk that ran out of time has not, and throwing it away would
+	 * turn a slow-but-recoverable purge into a full-TTL stale page — the very
+	 * failure this extension exists to prevent.
+	 */
+	public const CHUNK_OUT_OF_TIME = 'out-of-time';
+
 	/**
 	 * Cloudflare's purge endpoint, as a sprintf pattern over the zone ID.
 	 *
@@ -228,39 +249,89 @@ class CloudflarePurge {
 		array $chunks, string $zoneID, array $headers, int $retries, $logger,
 		CloudflarePurgeBudget $budget, int $totalUrls
 	) {
+		$chunks = array_values( $chunks );
 		$ok = true;
 		$attempted = 0;
-		$done = 0;
-		foreach ( $chunks as $chunk ) {
+
+		foreach ( $chunks as $i => $chunk ) {
+			// Two ways the budget can stop us, and both must defer rather than
+			// drop. The first is a chunk that never started. The second is the
+			// one that actually happens on the pre-send path, where the whole
+			// call is a single chunk: the ladder for *this* chunk ran out of
+			// time part-way through, so there is no "remainder" to speak of —
+			// the abandoned URLs are the ones we were in the middle of.
 			if ( $budget->isExhausted( static::now() ) ) {
-				$unsent = array_merge( ...array_slice( array_values( $chunks ), $done ) );
-				// Clipping the call must not become the very thing this
-				// extension exists to prevent, so what the budget did not
-				// reach is handed to the job queue rather than dropped. The
-				// job runs in CLI, where the budget is unlimited, so it gets
-				// the full ladder and cannot re-enter this branch.
-				$deferred = static::deferUrls( $unsent );
-				$logger->error(
-					'Cloudflare purge stopped by time budget: {unsent} of {total} URLs {disposition}',
-					[
-						'unsent' => count( $unsent ),
-						'total' => $totalUrls,
-						'disposition' => $deferred ? 'deferred to the job queue' : 'DROPPED',
-						'deferred' => $deferred,
-						'attempted' => $attempted,
-						'requestsDone' => $done,
-						'requestsTotal' => count( $chunks ),
-						'firstUrl' => $chunk[0] ?? '',
-					]
+				return static::abandonFrom(
+					$chunks, $i, $totalUrls, $attempted, $budget, $logger,
+					'no time left to start the request'
 				);
-				return false;
 			}
-			$ok = static::sendChunk( $chunk, $zoneID, $headers, $retries, $logger, $budget ) && $ok;
+
 			$attempted += count( $chunk );
-			$done++;
+			$status = static::sendChunk( $chunk, $zoneID, $headers, $retries, $logger, $budget );
+
+			if ( $status === self::CHUNK_OUT_OF_TIME ) {
+				return static::abandonFrom(
+					$chunks, $i, $totalUrls, $attempted, $budget, $logger,
+					'time ran out mid-request'
+				);
+			}
+			if ( $status !== self::CHUNK_OK ) {
+				$ok = false;
+			}
 		}
 
 		return $ok;
+	}
+
+	/**
+	 * Hand every URL from $from onwards to the job queue and say so.
+	 *
+	 * Shared by both budget exits so that neither can quietly grow a different
+	 * disposition from the other.
+	 *
+	 * @param string[][] $chunks
+	 * @param int $from Index of the first chunk that was not purged
+	 * @param int $totalUrls
+	 * @param int $attempted
+	 * @param CloudflarePurgeBudget $budget
+	 * @param Psr\Log\LoggerInterface $logger
+	 * @param string $reason
+	 * @return false
+	 */
+	private static function abandonFrom(
+		array $chunks, int $from, int $totalUrls, int $attempted,
+		CloudflarePurgeBudget $budget, $logger, string $reason
+	) {
+		$unsent = array_merge( ...array_slice( $chunks, $from ) );
+		// Clipping the call must not become the very thing this extension
+		// exists to prevent, so what the budget did not reach is handed to the
+		// job queue rather than dropped. The job runs in CLI, where the budget
+		// is unlimited, so it gets the full ladder and cannot re-enter here.
+		$deferred = static::deferUrls( $unsent );
+
+		$logger->error(
+			'Cloudflare purge stopped by time budget ({reason}): {unsent} of {total} URLs {disposition}',
+			[
+				'reason' => $reason,
+				'unsent' => count( $unsent ),
+				'total' => $totalUrls,
+				// "queued for" rather than "queued": lazyPush() schedules the
+				// enqueue as a post-send deferred update, so a true here means
+				// the hand-over was accepted, not that the job reached Redis.
+				// A failure after this point is logged by DeferredUpdates, not
+				// by us.
+				'disposition' => $deferred ? 'queued for the job queue' : 'DROPPED',
+				'deferred' => $deferred,
+				'attempted' => $attempted,
+				'requestsDone' => $from,
+				'requestsTotal' => count( $chunks ),
+				'budget' => $budget->budgetSeconds(),
+				'firstUrl' => $unsent[0] ?? '',
+			]
+		);
+
+		return false;
 	}
 
 	/**
@@ -274,8 +345,18 @@ class CloudflarePurge {
 	 * the response has not been flushed: the enqueue itself must not become
 	 * the next thing the editor waits on.
 	 *
+	 * That choice bounds what the return value can mean. lazyPush() registers
+	 * a post-send JobQueueEnqueueUpdate; it does not reach the queue backend
+	 * (Redis here) before returning. So true means "the hand-over was
+	 * accepted", not "the job is queued" — an enqueue that fails afterwards is
+	 * reported by DeferredUpdates, not on this extension's log channel. Using
+	 * push() would make the return value exact at the cost of putting a Redis
+	 * round-trip on the pre-send path, which is the thing being fixed. The log
+	 * wording says "queued for" rather than "queued" so the line does not
+	 * claim more than it knows.
+	 *
 	 * @param string[] $urls
-	 * @return bool Whether the URLs were successfully handed over
+	 * @return bool Whether the hand-over was accepted
 	 */
 	protected static function deferUrls( array $urls ) {
 		if ( !$urls ) {
@@ -347,7 +428,9 @@ class CloudflarePurge {
 	 * @param int $retries
 	 * @param Psr\Log\LoggerInterface $logger
 	 * @param CloudflarePurgeBudget $budget Wall-clock deadline for the whole call
-	 * @return bool
+	 * @return string One of the CHUNK_* constants. Not a bool, because "failed"
+	 *   and "ran out of time" need different dispositions from the caller: the
+	 *   first has had all the attempts it was going to get, the second has not.
 	 */
 	protected static function sendChunk(
 		array $urls, string $zoneID, array $headers, int $retries, $logger,
@@ -367,7 +450,7 @@ class CloudflarePurge {
 				$budget->clampTimeout( self::TOTAL_TIMEOUT_SECONDS, $now )
 			);
 			if ( $result['ok'] ) {
-				return true;
+				return self::CHUNK_OK;
 			}
 
 			$transport = $result['status'] === null
@@ -400,7 +483,8 @@ class CloudflarePurge {
 						'firstUrl' => $urls[0] ?? '',
 					]
 				);
-				return false;
+
+				return $outOfTime ? self::CHUNK_OUT_OF_TIME : self::CHUNK_FAILED;
 			}
 
 			$logger->warning(

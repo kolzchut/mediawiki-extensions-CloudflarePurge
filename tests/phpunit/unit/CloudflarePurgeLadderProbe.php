@@ -48,6 +48,9 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 	/** @var bool What deferUrls() should report */
 	public static $deferSucceeds = true;
 
+	/** @var bool Whether the scripted request succeeds after consuming its time */
+	public static $succeeds = false;
+
 	public static function reset() {
 		self::$clock = 0.0;
 		self::$curlErrno = 28;
@@ -56,6 +59,7 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 		self::$granted = [];
 		self::$deferred = null;
 		self::$deferSucceeds = true;
+		self::$succeeds = false;
 	}
 
 	/**
@@ -63,7 +67,7 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 	 * @param int $retries
 	 * @param CloudflarePurgeArrayLogger $logger
 	 * @param CloudflarePurgeBudget $budget
-	 * @return bool
+	 * @return string One of the CloudflarePurge::CHUNK_* constants
 	 */
 	public static function runChunk(
 		array $urls, int $retries, $logger, CloudflarePurgeBudget $budget
@@ -138,6 +142,16 @@ class CloudflarePurgeLadderProbe extends CloudflarePurge {
 			self::$clock += min( $connectTimeout, $totalTimeout );
 		} elseif ( self::$cost === 'total' ) {
 			self::$clock += $totalTimeout;
+		}
+
+		if ( self::$succeeds ) {
+			return [
+				'ok' => true,
+				'status' => 200,
+				'error' => '',
+				'curlErrno' => 0,
+				'retryAfter' => null,
+			];
 		}
 
 		return [

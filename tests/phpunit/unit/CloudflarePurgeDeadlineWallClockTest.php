@@ -93,15 +93,22 @@ class CloudflarePurgeDeadlineWallClockTest extends TestCase {
 		$logger = new CloudflarePurgeArrayLogger();
 
 		$start = microtime( true );
-		$ok = CloudflarePurgeSocketProbe::runChunk(
+		$status = CloudflarePurgeSocketProbe::runChunk(
 			[ 'https://example.org/A' ], 2, $logger,
 			CloudflarePurgeBudget::startingAt( $seconds, $start )
 		);
 		$elapsed = microtime( true ) - $start;
 
-		$this->assertFalse( $ok, 'a silent endpoint is a failed purge' );
+		// Timing first, deliberately. This is the headline evidence, and it is
+		// what a negative control needs to see fail: asserting the status
+		// before it would mask the measurement behind an enum mismatch.
+		//
 		// It used the budget rather than failing early for some other reason...
-		$this->assertGreaterThan( $seconds * 0.75, $elapsed );
+		$this->assertGreaterThan(
+			$seconds * 0.75,
+			$elapsed,
+			"ladder ran {$elapsed}s on a {$seconds}s budget"
+		);
 		// ...and it did not exceed it. Without the clamp this call would have
 		// waited out CloudflarePurge's 15-second per-request timeout instead.
 		$this->assertLessThan(
@@ -110,6 +117,9 @@ class CloudflarePurgeDeadlineWallClockTest extends TestCase {
 			"ladder ran {$elapsed}s on a {$seconds}s budget"
 		);
 		$this->assertLessThan( 15.0, $elapsed );
+		// Not merely failed: the deadline is what ended it, which is what
+		// makes the URLs eligible for deferral rather than a drop.
+		$this->assertSame( CloudflarePurge::CHUNK_OUT_OF_TIME, $status );
 
 		$errors = $logger->contextsAt( 'error' );
 		$this->assertCount( 1, $errors );

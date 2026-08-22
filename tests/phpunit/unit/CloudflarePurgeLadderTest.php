@@ -38,12 +38,12 @@ class CloudflarePurgeLadderTest extends TestCase {
 	public function testAnUnboundedLadderRunsForThreeQuartersOfAMinute() {
 		CloudflarePurgeLadderProbe::$cost = 'total';
 
-		$ok = CloudflarePurgeLadderProbe::runChunk(
+		$status = CloudflarePurgeLadderProbe::runChunk(
 			[ 'https://example.org/A' ], 2, $this->logger,
 			CloudflarePurgeBudget::unlimited()
 		);
 
-		$this->assertFalse( $ok );
+		$this->assertSame( CloudflarePurge::CHUNK_FAILED, $status );
 		$this->assertSame( 3, CloudflarePurgeLadderProbe::attempts() );
 		$this->assertEqualsWithDelta( 45.75, CloudflarePurgeLadderProbe::$clock, 1e-9 );
 		// Every attempt was handed the full per-request timeouts.
@@ -76,12 +76,14 @@ class CloudflarePurgeLadderTest extends TestCase {
 	public function testTheBudgetStopsTheLadderOnItsDeadline() {
 		CloudflarePurgeLadderProbe::$cost = 'total';
 
-		$ok = CloudflarePurgeLadderProbe::runChunk(
+		$status = CloudflarePurgeLadderProbe::runChunk(
 			[ 'https://example.org/A' ], 2, $this->logger,
 			CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
 		);
 
-		$this->assertFalse( $ok );
+		// Not merely "failed" — the caller has to be able to tell that time,
+		// rather than the failure itself, is what ended this.
+		$this->assertSame( CloudflarePurge::CHUNK_OUT_OF_TIME, $status );
 		$this->assertLessThanOrEqual( 5.0, CloudflarePurgeLadderProbe::$clock );
 		// The first attempt alone would have overrun the budget threefold had
 		// its timeout not been clamped to what the budget had left.
@@ -201,11 +203,47 @@ class CloudflarePurgeLadderTest extends TestCase {
 	}
 
 	/**
-	 * The budget must not become the very thing this extension exists to
-	 * prevent. What it clips is handed to MediaWiki's own CdnPurgeJob, which
-	 * re-enters purgeUrls() from the job runner — in CLI, with no budget.
+	 * The case that actually occurs.
+	 *
+	 * A pre-send purge is a *single chunk* — the edited page's URL plus
+	 * action=history, times one plus the extra hosts. So the budget almost
+	 * never stops the call "between chunks"; it stops it in the middle of the
+	 * only chunk there is. If the deferral covered only chunks that had not
+	 * started, it would never fire on the path it was written for, and every
+	 * clipped pre-send purge would be a silent full-TTL stale page — the exact
+	 * failure this extension exists to prevent, newly introduced by the budget
+	 * meant to protect the editor.
 	 */
-	public function testWhatTheBudgetClipsIsDeferredRatherThanDropped() {
+	public function testASingleChunkClippedMidLadderIsDeferred() {
+		CloudflarePurgeLadderProbe::$cost = 'total';
+		$urls = [
+			'https://example.org/A',
+			'https://example.org/A?action=history',
+			'https://kiosk.example.org/A',
+			'https://kiosk.example.org/A?action=history',
+		];
+
+		$ok = CloudflarePurgeLadderProbe::runChunks(
+			[ $urls ], 2, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertFalse( $ok );
+		$this->assertSame( $urls, CloudflarePurgeLadderProbe::$deferred );
+
+		$errors = $this->logger->contextsAt( 'error' );
+		$budgetLine = end( $errors );
+		$this->assertSame( 4, $budgetLine['unsent'] );
+		$this->assertSame( 4, $budgetLine['total'] );
+		$this->assertSame( 'time ran out mid-request', $budgetLine['reason'] );
+		$this->assertTrue( $budgetLine['deferred'] );
+		$this->assertSame( 5.0, $budgetLine['budget'] );
+	}
+
+	/**
+	 * With several chunks, the deferral covers the one the budget cut off *and*
+	 * everything behind it — not just the ones that never started.
+	 */
+	public function testTheClippedChunkIsDeferredAlongWithTheRemainder() {
 		CloudflarePurgeLadderProbe::$cost = 'total';
 		$chunks = [
 			[ 'https://example.org/A', 'https://example.org/B' ],
@@ -218,18 +256,44 @@ class CloudflarePurgeLadderTest extends TestCase {
 		);
 
 		$this->assertFalse( $ok );
-		// The first chunk consumed the whole budget; the rest never started.
+		// A and B are the chunk the budget cut off. They belong here just as
+		// much as C and D do.
 		$this->assertSame(
-			[ 'https://example.org/C', 'https://example.org/D' ],
+			[
+				'https://example.org/A',
+				'https://example.org/B',
+				'https://example.org/C',
+				'https://example.org/D',
+			],
 			CloudflarePurgeLadderProbe::$deferred
 		);
 
 		$errors = $this->logger->contextsAt( 'error' );
 		$budgetLine = end( $errors );
-		$this->assertSame( 2, $budgetLine['unsent'] );
+		$this->assertSame( 4, $budgetLine['unsent'] );
 		$this->assertSame( 4, $budgetLine['total'] );
 		$this->assertTrue( $budgetLine['deferred'] );
-		$this->assertSame( 'deferred to the job queue', $budgetLine['disposition'] );
+		$this->assertSame( 'queued for the job queue', $budgetLine['disposition'] );
+	}
+
+	/**
+	 * A chunk that never started is deferred too, by the same path.
+	 */
+	public function testAChunkThatNeverStartedIsDeferred() {
+		// The first chunk succeeds, but takes the whole budget doing it, so
+		// the second is refused before its first request rather than during it.
+		CloudflarePurgeLadderProbe::$cost = 'total';
+		CloudflarePurgeLadderProbe::$succeeds = true;
+		$chunks = [ [ 'https://example.org/A' ], [ 'https://example.org/B' ] ];
+
+		CloudflarePurgeLadderProbe::runChunks(
+			$chunks, 2, $this->logger, CloudflarePurgeBudget::startingAt( 5.0, 0.0 )
+		);
+
+		$this->assertSame( [ 'https://example.org/B' ], CloudflarePurgeLadderProbe::$deferred );
+		$errors = $this->logger->contextsAt( 'error' );
+		$budgetLine = end( $errors );
+		$this->assertSame( 'no time left to start the request', $budgetLine['reason'] );
 	}
 
 	/**
@@ -249,6 +313,24 @@ class CloudflarePurgeLadderTest extends TestCase {
 		$budgetLine = end( $errors );
 		$this->assertFalse( $budgetLine['deferred'] );
 		$this->assertSame( 'DROPPED', $budgetLine['disposition'] );
+	}
+
+	/**
+	 * The budget's own value reaches the log, so that a misconfigured
+	 * $wgCloudflarePurgePreSendBudgetSeconds is greppable from the abandonment
+	 * it causes rather than only inferable from it.
+	 */
+	public function testTheAbandonmentLineNamesTheDeadline() {
+		CloudflarePurgeLadderProbe::$cost = 'total';
+
+		CloudflarePurgeLadderProbe::runChunks(
+			[ [ 'https://example.org/A' ] ], 2, $this->logger,
+			CloudflarePurgeBudget::startingAt( 2.5, 0.0 )
+		);
+
+		$errors = $this->logger->contextsAt( 'error' );
+		$budgetLine = end( $errors );
+		$this->assertSame( 2.5, $budgetLine['budget'] );
 	}
 
 	/**

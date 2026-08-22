@@ -76,13 +76,25 @@ separate tables (verified 2026-08-23):
 - **URLs:** 800/s on Free, 1500/s on Pro and Business, 3000/s on
   Enterprise. This row is in the *single-file (by URL)* table.
 
-Requests are split at `$wgCloudflarePurgeUrlsPerRequest`. Note which limit
-binds for *this* extension: it sends `{"files": [...]}`, i.e. single-file
-purge by URL, and Cloudflare meters that in **URLs per second**. The
-request-rate row above governs purge by hostname, tag, prefix or
-purge-everything — none of which this extension issues. So the URL rate is
-the figure to watch, and at 100 URLs per request the request count is well
-inside its own limit long before the URL rate binds.
+Requests are split at `$wgCloudflarePurgeUrlsPerRequest`. Which limit binds
+for *this* extension turns on reading those two tables as **disjoint**,
+which is a reading rather than a stated fact — Cloudflare's own heading for
+the first is "Hostname, tag, prefix URL, and purge everything limits", and
+that stray "URL" is ambiguous.
+
+The reading taken here is that the request-rate row does *not* meter
+single-file purge, i.e. that `{"files": [...]}` — all this extension ever
+sends — is governed by the URLs/second row alone. Two things support it:
+the sibling table is titled "Single-file purge limits", and the max-ops
+rows differ (100 vs 500 on Enterprise), which only makes sense if the two
+tables cover disjoint operations.
+
+**If that reading is wrong**, a Free-plan account is capped at 5 purge
+*requests* per minute, which would bind long before 800 URLs/s and would
+make `$wgCloudflarePurgeUrlsPerRequest` the setting that matters most.
+Worth re-checking against Cloudflare's page before relying on the fan-out
+figures below on a Free plan; on Pro and above (5+/second) the distinction
+is academic at this extension's volumes.
 
 What bounds a single call is core, not this extension. Backlink purges
 arrive one leaf `HTMLCacheUpdateJob` at a time, and a leaf job carries at
@@ -165,10 +177,12 @@ and the ladder is what an editor waits for.
 `WikiPage::onArticleEdit()` (`WikiPage.php:2565`) purges the edited page at
 `:2588` with `PURGE_INTENT_TXROUND_REFLECTED`, which is
 `PURGE_PRESEND|PURGE_REBOUND`; `WikiPage::doPurge()` (`:1187`) uses a bare
-`PURGE_PRESEND` at `:1196`. Either way `HTMLCacheUpdater` defers the update
-at `DeferredUpdates::PRESEND` (`HTMLCacheUpdater.php:186-187`) — before the
-response is flushed. Nothing in a normal stack ends a purge that overruns
-there:
+`PURGE_PRESEND` at `:1196`. Either way the CDN purge is deferred at
+`DeferredUpdates::PRESEND` by `HTMLCacheUpdater::purgeUrls()`
+(`HTMLCacheUpdater.php:148-149`) — before the response is flushed. (The
+similar-looking pair at `:186-187` is the `$this->useFileCache` branch
+queueing an `HtmlFileCacheUpdate`, which is not this.) Nothing in a normal
+stack ends a purge that overruns there:
 
 - PHP's `max_execution_time` is a CPU-time timer (`ITIMER_PROF`) and does
   not tick while the process is blocked in cURL or `usleep`. Measured: a
@@ -214,9 +228,27 @@ so the clip is a *deferral*, not a loss. `CdnPurgeJob::run()` calls
 `CdnCacheUpdate::purge()`, which broadcasts on `cdn-url-purges` and so
 arrives back here, on the job runner, in CLI, with no budget and the full
 ladder. Because the budget is never armed on that path, a deferred purge
-cannot re-enter the branch that deferred it. The stop is still logged at
-error level with the URL count, and the log says whether the hand-over
-succeeded, because a failed enqueue *is* a full-TTL stale page.
+cannot re-enter the branch that deferred it.
+
+The budget can stop a call in **two** places, and both defer. It can refuse
+to start a chunk, which is what happens on a multi-chunk call; and it can
+cut off the ladder part-way through a chunk that has already begun, which
+is what happens on the pre-send path, where — see below — the whole call is
+a single chunk. Covering only the first would mean the deferral never fired
+on the path it was written for: every clipped pre-send purge would be a
+silent full-TTL stale page, and the budget would have introduced the exact
+failure it was added to prevent. `sendChunk()` therefore reports *why* it
+stopped, not just that it did.
+
+The stop is logged at error level with the URL count, the reason, the
+deadline that produced it, and whether the hand-over was accepted — because
+a failed enqueue *is* a full-TTL stale page. One caveat the log wording
+carries deliberately: `lazyPush()` registers the enqueue as a post-send
+deferred update, so "queued **for** the job queue" means the hand-over was
+accepted, not that the job reached Redis. A failure after that point is
+reported by `DeferredUpdates`, not on this channel. Using `push()` would
+make the claim exact at the cost of a Redis round-trip on the pre-send
+path, which is the thing being bounded.
 
 How many URLs a pre-send call actually carries: `HTMLCacheUpdater::getUrls()`
 yields the page URL plus `action=history` when `PURGE_URLS_LINKSUPDATE_ONLY`

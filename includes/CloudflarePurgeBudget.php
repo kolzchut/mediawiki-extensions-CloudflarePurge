@@ -36,11 +36,16 @@ class CloudflarePurgeBudget {
 	/** @var float|null Absolute deadline, or null when unbounded */
 	private $deadline;
 
+	/** @var float|null The budget as configured, kept for the log line */
+	private $seconds;
+
 	/**
 	 * @param float|null $deadline
+	 * @param float|null $seconds
 	 */
-	private function __construct( ?float $deadline ) {
+	private function __construct( ?float $deadline, ?float $seconds ) {
 		$this->deadline = $deadline;
+		$this->seconds = $seconds;
 	}
 
 	/**
@@ -50,7 +55,7 @@ class CloudflarePurgeBudget {
 	 * @return self
 	 */
 	public static function unlimited(): self {
-		return new self( null );
+		return new self( null, null );
 	}
 
 	/**
@@ -59,7 +64,7 @@ class CloudflarePurgeBudget {
 	 * @return self
 	 */
 	public static function startingAt( float $seconds, float $now ): self {
-		return new self( $now + $seconds );
+		return new self( $now + $seconds, $seconds );
 	}
 
 	/**
@@ -67,6 +72,18 @@ class CloudflarePurgeBudget {
 	 */
 	public function isLimited(): bool {
 		return $this->deadline !== null;
+	}
+
+	/**
+	 * The configured budget, so that a log line about an abandoned purge can
+	 * name the deadline that produced it. Without this a misconfigured
+	 * $wgCloudflarePurgePreSendBudgetSeconds is not greppable from the log it
+	 * causes.
+	 *
+	 * @return float|null Seconds, or null when unbounded
+	 */
+	public function budgetSeconds(): ?float {
+		return $this->seconds;
 	}
 
 	/**

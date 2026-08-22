@@ -26,8 +26,10 @@ class CloudflarePurgeRetryPolicyTest extends TestCase {
 		// 3 = CURLE_URL_MALFORMAT
 		$this->assertNull( CloudflarePurgeRetryPolicy::retryDelaySeconds( 0, 2, null, 3 ) );
 
+		// 60 is peer-certificate verification; CURLE_SSL_CACERT (51) is its
+		// obsolete alias, not the other way round.
 		$this->assertSame(
-			'TLS CA certificate verification failed',
+			'TLS peer certificate verification failed',
 			CloudflarePurgeRetryPolicy::permanentTransportReason( 60 )
 		);
 		$this->assertNull( CloudflarePurgeRetryPolicy::permanentTransportReason( 28 ) );
