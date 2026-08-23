@@ -18,12 +18,18 @@
 
 name: CI
 
+# No workflow_dispatch, deliberately. GitHub only offers the manual trigger
+# for workflows present on the repository's DEFAULT branch, which here is the
+# upstream mirror `master` — and `master` carries neither phpunit.xml.dist nor
+# the bootstrap, so a dispatched run there could only fail. Declaring a button
+# that never appears is the same class of dead control this workflow exists to
+# remove. `gh run rerun <id>` re-runs any of these on demand. If the default
+# branch ever becomes `kolzchut-main`, add it back.
 on:
   push:
     branches:
       - kolzchut-main
   pull_request:
-  workflow_dispatch:
 
 # The default GITHUB_TOKEN scope is not relied on: this workflow only reads
 # the tree.
@@ -57,7 +63,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up PHP
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2.37.2
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2 (upstream tags are unprefixed; v2.37.2 does not exist)
         with:
           php-version: ${{ matrix.php }}
           # curl is named explicitly rather than left to the runner image:
