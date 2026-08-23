@@ -42,10 +42,16 @@ jobs:
       fail-fast: false
       matrix:
         # 8.3 is what production runs (the MediaWiki images are built on
-        # php:8.3-fpm); 8.1 is MediaWiki 1.43's floor, so a syntax or
-        # behaviour change that needs a newer PHP is caught before a REL
-        # branch inherits it.
-        php: [ '8.1', '8.3' ]
+        # php:8.3-fpm); 8.2 is the lower bound, so a change that quietly
+        # needs a newer PHP is caught before a REL branch inherits it.
+        #
+        # Not 8.1, which is MediaWiki 1.43's own floor: this repository's dev
+        # dependencies (mediawiki-codesniffer, minus-x) require PHP >= 8.2, so
+        # `composer update` cannot even resolve there. The extension's own
+        # code is 8.1-clean as far as anything here can tell, but nothing
+        # proves it — see the PR for why that gap is left open rather than
+        # papered over.
+        php: [ '8.2', '8.3' ]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
