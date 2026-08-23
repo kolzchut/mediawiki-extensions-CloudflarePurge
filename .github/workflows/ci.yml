@@ -139,28 +139,6 @@ jobs:
         # every installed package really does support the PHP running it.
         run: composer update --no-interaction --no-progress --prefer-dist
 
-      - name: NEGATIVE CONTROL B (temporary) - unreachable advisory database
-        # Temporary. Proves on a real runner what the audit step's comment
-        # claims: with the advisory API black-holed, the command as shipped
-        # fails, and the same command plus --ignore-unreachable reports a
-        # green all-clear. continue-on-error so control A - the real audit
-        # step below, against the advisory-affected pins in this commit -
-        # still gets to run in the same job.
-        continue-on-error: true
-        env:
-          http_proxy: http://127.0.0.1:1
-          https_proxy: http://127.0.0.1:1
-        run: |
-          set +e
-          composer --version
-          echo '--- as shipped: expect NON-ZERO ---'
-          composer audit --no-interaction
-          echo "CONTROL B as-shipped exit=$?"
-          echo '--- with --ignore-unreachable, the trap: expect 0 + all-clear ---'
-          composer audit --no-interaction --ignore-unreachable
-          echo "CONTROL B ignore-unreachable exit=$?"
-          exit 1
-
       - name: Audit dependencies for security advisories
         # WHY THIS STEP EXISTS. This workflow's first run (PR #3) failed to
         # install, because phpunit/phpunit 9.6.29 and the
