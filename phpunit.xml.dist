@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+	Runs the MediaWiki-free unit suite only.
+
+	tests/phpunit/integration/ is deliberately NOT a testsuite here: it is an
+	upgrade canary that needs a real MediaWiki and a database, so it runs under
+	MediaWiki's own runner, not this one. Listing only the unit directory means
+	a new file dropped into integration/ cannot quietly join a run that has no
+	wiki to give it.
+-->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+	bootstrap="tests/phpunit/bootstrap.php"
+	colors="true"
+	beStrictAboutTestsThatDoNotTestAnything="true"
+	beStrictAboutOutputDuringTests="true"
+	failOnRisky="true"
+	failOnWarning="true"
+	failOnIncomplete="true"
+	failOnSkipped="true"
+	failOnEmptyTestSuite="true"
+	convertDeprecationsToExceptions="true">
+	<testsuites>
+		<testsuite name="unit">
+			<directory>tests/phpunit/unit</directory>
+		</testsuite>
+	</testsuites>
+</phpunit>
