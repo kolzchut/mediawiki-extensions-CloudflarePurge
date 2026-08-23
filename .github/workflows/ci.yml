@@ -42,22 +42,63 @@ concurrency:
 
 jobs:
   test:
-    name: PHP ${{ matrix.php }}
+    name: PHP ${{ matrix.php }}${{ matrix.note }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # 8.3 is what production runs (the MediaWiki images are built on
-        # php:8.3-fpm); 8.2 is the lower bound, so a change that quietly
-        # needs a newer PHP is caught before a REL branch inherits it.
+        # php:8.3-fpm). 8.2 is the floor the full dev toolchain can install
+        # on. 8.1 is MediaWiki 1.43's own floor, and therefore the oldest
+        # version a REL branch of this extension could legitimately be
+        # installed on — the version that matters most for compatibility and
+        # the one this matrix used to miss.
         #
-        # Not 8.1, which is MediaWiki 1.43's own floor: this repository's dev
-        # dependencies (mediawiki-codesniffer, minus-x) require PHP >= 8.2, so
-        # `composer update` cannot even resolve there. The extension's own
-        # code is 8.1-clean as far as anything here can tell, but nothing
-        # proves it — see the PR for why that gap is left open rather than
-        # papered over.
-        php: [ '8.2', '8.3' ]
+        # POLARITY, and it is load-bearing. The flag is named for the REDUCED
+        # job and only that job sets it, so an entry that forgets it gets the
+        # FULL one. GitHub coerces an absent key and `false` alike to the
+        # number 0, so a gate written `== false` is TRUE for a missing key
+        # exactly as `!= true` is — measured, not assumed, in run 32622730722.
+        # A flag whose true sense meant "runs the full trio", with the reduced
+        # steps gated on `== false`, would therefore hand a future
+        # `- php: '8.4'` the lint-only job under a job name that did not say
+        # so: coverage quietly narrower than the title claims, which is the
+        # one shape this workflow exists to refuse. Only `== true` is false
+        # for an absent key, so only a reduced-sense flag defaults to safety.
+        #
+        # 8.2 and 8.3 omit the key rather than setting it false, so every run
+        # exercises the absent-key path and re-proves the default is full.
+        include:
+          - php: '8.3'
+            note: ''
+          - php: '8.2'
+            note: ''
+
+          # WHY 8.1 RUNS LESS. mediawiki/mediawiki-codesniffer 51.0.1
+          # requires php >=8.2.0 and mediawiki/minus-x 2.0.1 requires
+          # php >=8.2, so the full dev set cannot resolve here. Nothing else
+          # in require-dev blocks: php-parallel-lint needs >=5.3.0 and
+          # phpunit/phpunit 9.6.36 needs >=7.3, and mediawiki-phan-config
+          # resolves too. Dropping exactly those two packages gives a set
+          # that installs on a real 8.1 with no --ignore-platform-req and no
+          # advisory hits.
+          #
+          # --ignore-platform-req is the option NOT taken, on purpose. It
+          # would install phpcs and minus-x builds this PHP cannot run, so
+          # the job would either crash on tooling or — worse — pass, and a
+          # green 8.1 badge earned by the wrong toolchain converts an open
+          # question into a false answer. Running less, and saying so in the
+          # job name, is the honest version.
+          #
+          # What 8.1 therefore does NOT cover: code style (phpcs) and
+          # executable bits (minus-x). Neither is PHP-version-dependent, so
+          # both are fully covered by the 8.2 and 8.3 jobs. What 8.1 DOES
+          # cover is the part that is version-dependent: parallel-lint parses
+          # every file with the 8.1 parser, and the whole unit suite —
+          # including the real-cURL wall-clock test — runs on an 8.1 build.
+          - php: '8.1'
+            note: ' (lint + tests; no phpcs/minus-x)'
+            lint_only: true
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,21 +114,51 @@ jobs:
           coverage: none
           tools: composer:v2
 
+      - name: Drop the dev tooling that requires PHP 8.2
+        if: matrix.lint_only == true
+        # A deny-list, not an allow-list, and that direction is the point: a
+        # future dev dependency that also requires 8.2+ makes this job go RED
+        # at the install step rather than being silently skipped out of the
+        # 8.1 run. Red is then a decision to make deliberately — extend this
+        # list, or drop the floor — instead of coverage quietly shrinking.
+        #
+        # `composer remove` on a package that is not there warns and exits 0,
+        # so a stale name here is a no-op; it cannot manufacture a green,
+        # because anything still unsatisfiable on 8.1 fails `composer update`
+        # in the next step.
+        run: >
+          composer remove --dev --no-update --no-interaction
+          mediawiki/mediawiki-codesniffer mediawiki/minus-x
+
       - name: Install dependencies
         # composer.lock is not committed (see .gitignore), so `update` is the
         # honest verb. Direct dev requirements are exact-pinned in
         # composer.json, so this is reproducible where it matters.
+        #
+        # Deliberately no --ignore-platform-req on any job: if this resolves,
+        # every installed package really does support the PHP running it.
         run: composer update --no-interaction --no-progress --prefer-dist
 
       - name: Static checks (parallel-lint, phpcs, minus-x)
+        if: matrix.lint_only != true
         run: composer test
 
+      - name: Lint (parallel-lint)
+        if: matrix.lint_only == true
+        # `composer test` would fail here on the two packages removed above.
+        # This runs the same parallel-lint invocation `test` runs, because
+        # `test` is defined as `@lint` plus the other two — one definition,
+        # so the 8.1 job cannot drift away from what the others lint.
+        run: composer lint
+
       - name: Unit tests
+        id: phpunit
         # phpunit.xml.dist sets failOnSkipped/failOnIncomplete/failOnRisky and
         # failOnEmptyTestSuite, so a sandbox that cannot open a loopback
         # socket, a PHP without ext-curl, or a bootstrap that stops finding
         # the tests all turn this job red instead of printing a green
-        # "OK, but ... skipped".
+        # "OK, but ... skipped". That file is shared by every matrix entry,
+        # so 8.1 gets those guards on exactly the same terms.
         run: composer phpunit -- --log-junit junit.xml
 
       - name: Report wall-clock timing margins
@@ -96,5 +167,27 @@ jobs:
         # every run means a drift toward the ceiling is visible while it is
         # still green — a timing gate that only ever speaks by going red is
         # one people learn to ignore.
-        if: always() && hashFiles('junit.xml') != ''
-        run: python3 .github/timing-margins.py junit.xml
+        #
+        # Runs on 8.1 too. So far it measures identically to 8.2 and 8.3 to
+        # the centisecond, so the value there is regression detection rather
+        # than a distinct signal — but it is the only place a drift in
+        # setup-php's per-version curl build would surface.
+        #
+        # Gated on the test step having RUN, deliberately NOT on junit.xml
+        # existing. Under the old `hashFiles('junit.xml') != ''`, a run where
+        # phpunit exited 0 without writing the log SKIPPED this guard instead
+        # of failing — the single path on which the only check that catches a
+        # renamed or deleted wall-clock test silently does not check.
+        if: always() && steps.phpunit.outcome != 'skipped'
+        run: |
+          if [ -f junit.xml ]; then
+            exec python3 .github/timing-margins.py junit.xml
+          fi
+          # No log at all. If phpunit itself failed it has already turned this
+          # job red and said why; a second error would only obscure it.
+          if [ '${{ steps.phpunit.outcome }}' != 'success' ]; then
+            echo '::warning::no junit.xml; phpunit failed above'
+            exit 0
+          fi
+          echo '::error::phpunit exited 0 but wrote no junit.xml - the guard that catches a renamed or deleted wall-clock test could not run'
+          exit 1
