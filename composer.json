@@ -8,8 +8,9 @@
 		"phpunit/phpunit": "9.6.36"
 	},
 	"scripts": {
+		"lint": "parallel-lint . --exclude vendor --exclude node_modules",
 		"test": [
-			"parallel-lint . --exclude vendor --exclude node_modules",
+			"@lint",
 			"@phpcs",
 			"minus-x check ."
 		],

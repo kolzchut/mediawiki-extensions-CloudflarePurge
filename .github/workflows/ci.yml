@@ -42,22 +42,50 @@ concurrency:
 
 jobs:
   test:
-    name: PHP ${{ matrix.php }}
+    name: PHP ${{ matrix.php }}${{ matrix.note }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # 8.3 is what production runs (the MediaWiki images are built on
-        # php:8.3-fpm); 8.2 is the lower bound, so a change that quietly
-        # needs a newer PHP is caught before a REL branch inherits it.
-        #
-        # Not 8.1, which is MediaWiki 1.43's own floor: this repository's dev
-        # dependencies (mediawiki-codesniffer, minus-x) require PHP >= 8.2, so
-        # `composer update` cannot even resolve there. The extension's own
-        # code is 8.1-clean as far as anything here can tell, but nothing
-        # proves it — see the PR for why that gap is left open rather than
-        # papered over.
-        php: [ '8.2', '8.3' ]
+        # php:8.3-fpm). 8.2 is the floor the full dev toolchain can install
+        # on. 8.1 is MediaWiki 1.43's own floor, and therefore the oldest
+        # version a REL branch of this extension could legitimately be
+        # installed on — the version that matters most for compatibility and
+        # the one this matrix used to miss.
+        include:
+          - php: '8.3'
+            note: ''
+            static_trio: true
+          - php: '8.2'
+            note: ''
+            static_trio: true
+
+          # WHY 8.1 RUNS LESS. mediawiki/mediawiki-codesniffer 51.0.1
+          # requires php >=8.2.0 and mediawiki/minus-x 2.0.1 requires
+          # php >=8.2, so the full dev set cannot resolve here. Nothing else
+          # in require-dev blocks: php-parallel-lint needs >=5.3.0 and
+          # phpunit/phpunit 9.6.36 needs >=7.3, and mediawiki-phan-config
+          # resolves too. Dropping exactly those two packages gives a set
+          # that installs on a real 8.1 with no --ignore-platform-req and no
+          # advisory hits.
+          #
+          # --ignore-platform-req is the option NOT taken, on purpose. It
+          # would install phpcs and minus-x builds this PHP cannot run, so
+          # the job would either crash on tooling or — worse — pass, and a
+          # green 8.1 badge earned by the wrong toolchain converts an open
+          # question into a false answer. Running less, and saying so in the
+          # job name, is the honest version.
+          #
+          # What 8.1 therefore does NOT cover: code style (phpcs) and
+          # executable bits (minus-x). Neither is PHP-version-dependent, so
+          # both are fully covered by the 8.2 and 8.3 jobs. What 8.1 DOES
+          # cover is the part that is version-dependent: parallel-lint parses
+          # every file with the 8.1 parser, and the whole unit suite —
+          # including the real-cURL wall-clock test — runs on an 8.1 build.
+          - php: '8.1'
+            note: ' (lint + tests; no phpcs/minus-x)'
+            static_trio: false
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,21 +101,50 @@ jobs:
           coverage: none
           tools: composer:v2
 
+      - name: Drop the dev tooling that requires PHP 8.2
+        if: matrix.static_trio != true
+        # A deny-list, not an allow-list, and that direction is the point: a
+        # future dev dependency that also requires 8.2+ makes this job go RED
+        # at the install step rather than being silently skipped out of the
+        # 8.1 run. Red is then a decision to make deliberately — extend this
+        # list, or drop the floor — instead of coverage quietly shrinking.
+        #
+        # `composer remove` on a package that is not there warns and exits 0,
+        # so a stale name here is a no-op; it cannot manufacture a green,
+        # because anything still unsatisfiable on 8.1 fails `composer update`
+        # in the next step.
+        run: >
+          composer remove --dev --no-update --no-interaction
+          mediawiki/mediawiki-codesniffer mediawiki/minus-x
+
       - name: Install dependencies
         # composer.lock is not committed (see .gitignore), so `update` is the
         # honest verb. Direct dev requirements are exact-pinned in
         # composer.json, so this is reproducible where it matters.
+        #
+        # Deliberately no --ignore-platform-req on any job: if this resolves,
+        # every installed package really does support the PHP running it.
         run: composer update --no-interaction --no-progress --prefer-dist
 
       - name: Static checks (parallel-lint, phpcs, minus-x)
+        if: matrix.static_trio == true
         run: composer test
+
+      - name: Lint (parallel-lint)
+        if: matrix.static_trio != true
+        # `composer test` would fail here on the two packages removed above.
+        # This runs the same parallel-lint invocation `test` runs, because
+        # `test` is defined as `@lint` plus the other two — one definition,
+        # so the 8.1 job cannot drift away from what the others lint.
+        run: composer lint
 
       - name: Unit tests
         # phpunit.xml.dist sets failOnSkipped/failOnIncomplete/failOnRisky and
         # failOnEmptyTestSuite, so a sandbox that cannot open a loopback
         # socket, a PHP without ext-curl, or a bootstrap that stops finding
         # the tests all turn this job red instead of printing a green
-        # "OK, but ... skipped".
+        # "OK, but ... skipped". That file is shared by every matrix entry,
+        # so 8.1 gets those guards on exactly the same terms.
         run: composer phpunit -- --log-junit junit.xml
 
       - name: Report wall-clock timing margins
@@ -96,5 +153,8 @@ jobs:
         # every run means a drift toward the ceiling is visible while it is
         # still green — a timing gate that only ever speaks by going red is
         # one people learn to ignore.
+        #
+        # Runs on 8.1 too, and that is not a formality: the margin depends on
+        # the curl build behind the PHP, which setup-php compiles per version.
         if: always() && hashFiles('junit.xml') != ''
         run: python3 .github/timing-margins.py junit.xml
