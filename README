@@ -280,3 +280,29 @@ the whole extension rests on. It deliberately stops at the channel, with a
 capturing relayer standing in for `CloudflarePurgeRelayer` — going further
 would mean issuing a real purge against a real Cloudflare zone. It needs a
 database.
+
+### Running them
+
+The unit suite needs no MediaWiki, no `LocalSettings.php` and no database
+— only PHP with ext-curl and PHPUnit, with an autoloader built from
+`extension.json`. So it is a plain PHPUnit run, not `tests/phpunit/phpunit.php`:
+
+```sh
+composer update          # composer.lock is not committed
+composer phpunit         # 53 tests, ~2.2s
+composer test            # parallel-lint + phpcs + minus-x
+```
+
+`.github/workflows/ci.yml` runs both on every push to `kolzchut-main` and
+on every pull request.
+
+`phpunit.xml.dist` sets `failOnSkipped`, and that is deliberate. The
+wall-clock test skips itself when it cannot open a loopback socket or when
+ext-curl is missing — which would leave a sandbox printing a green
+"OK, but ... skipped" while the suite had silently lost its only
+real-request coverage. Verified: forcing the listen to fail leaves a
+default run green at exit 0 with 2 skipped, and red with the setting on.
+
+`tests/phpunit/integration` is not part of that run — it is excluded from
+`phpunit.xml.dist` because it needs a real wiki and a database, and runs
+under MediaWiki's own runner.

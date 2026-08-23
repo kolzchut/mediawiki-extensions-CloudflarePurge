@@ -1,0 +1,100 @@
+# Runs this extension's own checks: the MediaWiki-free unit suite, and the
+# static trio (parallel-lint, phpcs, minus-x) that `composer test` already
+# defined but nothing invoked.
+#
+# WHY HERE. The tests live here, review happens here (PRs against
+# `kolzchut-main`), and this repository is public — so these minutes are free
+# and cannot be stopped by the organisation's Actions budget, which hit $0 in
+# August 2026 and halted every private-repo workflow. A job hosted in a
+# consuming superproject would bill private minutes, would only notice a
+# regression after a submodule pointer bump, and would put the red on a
+# reviewer who did not write the change.
+#
+# WHY NO MEDIAWIKI. Everything under tests/phpunit/unit/ exercises plain
+# classes, so it runs under plain PHPUnit with the autoloader in
+# tests/phpunit/bootstrap.php — no wiki install, no LocalSettings.php, no
+# database. tests/phpunit/integration/ is an upgrade canary that does need
+# those; phpunit.xml.dist declares only the unit directory, so it stays out.
+
+name: CI
+
+# No workflow_dispatch, deliberately. GitHub only offers the manual trigger
+# for workflows present on the repository's DEFAULT branch, which here is the
+# upstream mirror `master` — and `master` carries neither phpunit.xml.dist nor
+# the bootstrap, so a dispatched run there could only fail. Declaring a button
+# that never appears is the same class of dead control this workflow exists to
+# remove. `gh run rerun <id>` re-runs any of these on demand. If the default
+# branch ever becomes `kolzchut-main`, add it back.
+on:
+  push:
+    branches:
+      - kolzchut-main
+  pull_request:
+
+# The default GITHUB_TOKEN scope is not relied on: this workflow only reads
+# the tree.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 8.3 is what production runs (the MediaWiki images are built on
+        # php:8.3-fpm); 8.2 is the lower bound, so a change that quietly
+        # needs a newer PHP is caught before a REL branch inherits it.
+        #
+        # Not 8.1, which is MediaWiki 1.43's own floor: this repository's dev
+        # dependencies (mediawiki-codesniffer, minus-x) require PHP >= 8.2, so
+        # `composer update` cannot even resolve there. The extension's own
+        # code is 8.1-clean as far as anything here can tell, but nothing
+        # proves it — see the PR for why that gap is left open rather than
+        # papered over.
+        php: [ '8.2', '8.3' ]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2 (upstream tags are unprefixed; v2.37.2 does not exist)
+        with:
+          php-version: ${{ matrix.php }}
+          # curl is named explicitly rather than left to the runner image:
+          # the wall-clock test skips itself without ext-curl, and a skip is
+          # how this suite would lose its only real-request coverage quietly.
+          extensions: curl, json, mbstring, dom, xml
+          coverage: none
+          tools: composer:v2
+
+      - name: Install dependencies
+        # composer.lock is not committed (see .gitignore), so `update` is the
+        # honest verb. Direct dev requirements are exact-pinned in
+        # composer.json, so this is reproducible where it matters.
+        run: composer update --no-interaction --no-progress --prefer-dist
+
+      - name: Static checks (parallel-lint, phpcs, minus-x)
+        run: composer test
+
+      - name: Unit tests
+        # phpunit.xml.dist sets failOnSkipped/failOnIncomplete/failOnRisky and
+        # failOnEmptyTestSuite, so a sandbox that cannot open a loopback
+        # socket, a PHP without ext-curl, or a bootstrap that stops finding
+        # the tests all turn this job red instead of printing a green
+        # "OK, but ... skipped".
+        run: composer phpunit -- --log-junit junit.xml
+
+      - name: Report wall-clock timing margins
+        # The deadline test measures real elapsed time, so its headroom is a
+        # property of the runner, not of the code. Printing the margin on
+        # every run means a drift toward the ceiling is visible while it is
+        # still green — a timing gate that only ever speaks by going red is
+        # one people learn to ignore.
+        if: always() && hashFiles('junit.xml') != ''
+        run: python3 .github/timing-margins.py junit.xml
