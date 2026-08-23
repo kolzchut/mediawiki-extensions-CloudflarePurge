@@ -139,6 +139,86 @@ jobs:
         # every installed package really does support the PHP running it.
         run: composer update --no-interaction --no-progress --prefer-dist
 
+      - name: Audit dependencies for security advisories
+        # WHY THIS STEP EXISTS. This workflow's first run (PR #3) failed to
+        # install, because phpunit/phpunit 9.6.29 and the
+        # squizlabs/php_codesniffer 3.13.5 that mediawiki-codesniffer 51.0.0
+        # pins were both under high-severity advisories (CVE-2026-24765,
+        # CVE-2026-67434). A real catch - but NOTHING HERE ASKED FOR IT. What
+        # refused was Composer's own resolver policy, `policy.advisories.block`,
+        # whose default is true in whatever `composer:v2` the runner resolves.
+        # That guard is unversioned, invisible in this file, and would vanish
+        # silently if the default flipped or an older Composer were pinned: a
+        # workstation Composer 2.7.7 installs both packages with nothing worse
+        # than a warning. This step makes the guard ours.
+        # kolzchut/kz-infrastructure#1048.
+        #
+        # THREE DISTINCT MECHANISMS, easy to confuse:
+        #   1. `policy.advisories.block` - resolver-level, refuses to LOAD an
+        #      affected version. This is what fired in PR #3.
+        #   2. the implicit post-install audit run by `install`/`update`.
+        #   3. this explicit `composer audit` command.
+        # `COMPOSER_NO_AUDIT: 1` - which setup-php exports into $GITHUB_ENV, so
+        # every later step in every job inherits it - suppresses (2) ONLY.
+        # Measured, not assumed: with `COMPOSER_NO_AUDIT=1` exported, an
+        # advisory-affected set still fails to resolve under (1) on 2.10.2, and
+        # this command still reports both advisories on 2.7.7 and 2.10.2 alike.
+        # So the variable is left exactly as setup-php sets it. Unsetting it
+        # would only re-enable (2), a duplicate of this step run at a worse
+        # moment - output buried in install noise, red indistinguishable from a
+        # resolution failure, and flags chosen by someone else's environment
+        # rather than written here. Flag control is most of this step's value,
+        # so a second copy without it is not complementary, it is noise.
+        #
+        # NO `if:`, DELIBERATELY. Every matrix entry audits, including a future
+        # entry that forgets `lint_only` - there is no flag here to forget.
+        # That matters because the 8.1 entry installs a genuinely DIFFERENT
+        # set: `composer remove` above drops mediawiki-codesniffer, and
+        # squizlabs/php_codesniffer goes with it - the package carrying
+        # CVE-2026-67434. Auditing only 8.1 would have missed that advisory
+        # entirely; auditing only 8.2/8.3 would leave the reduced set unread.
+        # The negative control shows exactly that split: 2 advisories on
+        # 8.2/8.3, 1 on 8.1.
+        #
+        # PLACED BEFORE THE CHECKS, not after, so it holds the position the
+        # resolver block held: an unsafe dependency set stops the job before
+        # its code is executed. Not academic here - CVE-2026-67434 is OS
+        # command injection in php_codesniffer, which `composer test` runs.
+        #
+        # NO FLAGS BEYOND --no-interaction, and the omissions are the point.
+        #
+        # NOT `--ignore-unreachable`, which is the load-bearing omission.
+        # `composer audit` exits 0 when it finds nothing and, WITH that flag,
+        # also when it could not reach the advisory database - printing "No
+        # security vulnerability advisories found." and a quiet note that a
+        # repository was unreachable. Measured on this runner with the advisory
+        # API black-holed: as shipped exit 100, with the flag exit 0 and a
+        # green all-clear. Decorative on exactly the days it matters. This step
+        # fails closed instead: a packagist outage reddens the job and someone
+        # re-runs it. Do not add the flag to quiet a flake.
+        #
+        # NOT `--abandoned=...` either, for the opposite reason: its default is
+        # already the strict one. Measured - an abandoned package with no
+        # advisory at all exits 1 on both 2.7.7 and 2.10.2 - and the option
+        # does not exist before 2.7, so writing it down would break this exact
+        # command on an older workstation Composer while changing nothing on
+        # the runner. The residual exposure is bounded and named: a future
+        # Composer defaulting abandonment to `ignore` would quietly stop
+        # reporting abandonment. It would not weaken advisory detection, which
+        # is what this gate is for.
+        #
+        # Composer stays floating (`composer:v2`) on purpose: now that the
+        # check is asked for here rather than inherited, a newer Composer can
+        # only improve the advisory data behind it. `composer --version` is
+        # printed so the log records which Composer returned the verdict.
+        #
+        # Exit codes measured while building this, 2.10.2 / 2.7.7:
+        # clean 0/0, advisories found 1/2, database unreachable 100/100,
+        # abandoned package 1/1.
+        run: |
+          composer --version
+          composer audit --no-interaction
+
       - name: Static checks (parallel-lint, phpcs, minus-x)
         if: matrix.lint_only != true
         run: composer test
