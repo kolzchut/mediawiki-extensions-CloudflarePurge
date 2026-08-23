@@ -53,13 +53,26 @@ jobs:
         # version a REL branch of this extension could legitimately be
         # installed on — the version that matters most for compatibility and
         # the one this matrix used to miss.
+        #
+        # POLARITY, and it is load-bearing. The flag is named for the REDUCED
+        # job and only that job sets it, so an entry that forgets it gets the
+        # FULL one. GitHub coerces an absent key and `false` alike to the
+        # number 0, so a gate written `== false` is TRUE for a missing key
+        # exactly as `!= true` is — measured, not assumed, in run 32622730722.
+        # A flag whose true sense meant "runs the full trio", with the reduced
+        # steps gated on `== false`, would therefore hand a future
+        # `- php: '8.4'` the lint-only job under a job name that did not say
+        # so: coverage quietly narrower than the title claims, which is the
+        # one shape this workflow exists to refuse. Only `== true` is false
+        # for an absent key, so only a reduced-sense flag defaults to safety.
+        #
+        # 8.2 and 8.3 omit the key rather than setting it false, so every run
+        # exercises the absent-key path and re-proves the default is full.
         include:
           - php: '8.3'
             note: ''
-            static_trio: true
           - php: '8.2'
             note: ''
-            static_trio: true
 
           # WHY 8.1 RUNS LESS. mediawiki/mediawiki-codesniffer 51.0.1
           # requires php >=8.2.0 and mediawiki/minus-x 2.0.1 requires
@@ -85,7 +98,7 @@ jobs:
           # including the real-cURL wall-clock test — runs on an 8.1 build.
           - php: '8.1'
             note: ' (lint + tests; no phpcs/minus-x)'
-            static_trio: false
+            lint_only: true
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,7 +115,7 @@ jobs:
           tools: composer:v2
 
       - name: Drop the dev tooling that requires PHP 8.2
-        if: matrix.static_trio != true
+        if: matrix.lint_only == true
         # A deny-list, not an allow-list, and that direction is the point: a
         # future dev dependency that also requires 8.2+ makes this job go RED
         # at the install step rather than being silently skipped out of the
@@ -127,11 +140,11 @@ jobs:
         run: composer update --no-interaction --no-progress --prefer-dist
 
       - name: Static checks (parallel-lint, phpcs, minus-x)
-        if: matrix.static_trio == true
+        if: matrix.lint_only != true
         run: composer test
 
       - name: Lint (parallel-lint)
-        if: matrix.static_trio != true
+        if: matrix.lint_only == true
         # `composer test` would fail here on the two packages removed above.
         # This runs the same parallel-lint invocation `test` runs, because
         # `test` is defined as `@lint` plus the other two — one definition,
@@ -139,6 +152,7 @@ jobs:
         run: composer lint
 
       - name: Unit tests
+        id: phpunit
         # phpunit.xml.dist sets failOnSkipped/failOnIncomplete/failOnRisky and
         # failOnEmptyTestSuite, so a sandbox that cannot open a loopback
         # socket, a PHP without ext-curl, or a bootstrap that stops finding
@@ -154,7 +168,26 @@ jobs:
         # still green — a timing gate that only ever speaks by going red is
         # one people learn to ignore.
         #
-        # Runs on 8.1 too, and that is not a formality: the margin depends on
-        # the curl build behind the PHP, which setup-php compiles per version.
-        if: always() && hashFiles('junit.xml') != ''
-        run: python3 .github/timing-margins.py junit.xml
+        # Runs on 8.1 too. So far it measures identically to 8.2 and 8.3 to
+        # the centisecond, so the value there is regression detection rather
+        # than a distinct signal — but it is the only place a drift in
+        # setup-php's per-version curl build would surface.
+        #
+        # Gated on the test step having RUN, deliberately NOT on junit.xml
+        # existing. Under the old `hashFiles('junit.xml') != ''`, a run where
+        # phpunit exited 0 without writing the log SKIPPED this guard instead
+        # of failing — the single path on which the only check that catches a
+        # renamed or deleted wall-clock test silently does not check.
+        if: always() && steps.phpunit.outcome != 'skipped'
+        run: |
+          if [ -f junit.xml ]; then
+            exec python3 .github/timing-margins.py junit.xml
+          fi
+          # No log at all. If phpunit itself failed it has already turned this
+          # job red and said why; a second error would only obscure it.
+          if [ '${{ steps.phpunit.outcome }}' != 'success' ]; then
+            echo '::warning::no junit.xml; phpunit failed above'
+            exit 0
+          fi
+          echo '::error::phpunit exited 0 but wrote no junit.xml - the guard that catches a renamed or deleted wall-clock test could not run'
+          exit 1

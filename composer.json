@@ -1,4 +1,7 @@
 {
+	"require": {
+		"php": ">=8.1"
+	},
 	"require-dev": {
 		"mediawiki/mediawiki-codesniffer": "51.0.1",
 		"mediawiki/mediawiki-phan-config": "0.20.0",
