@@ -24,8 +24,10 @@
 	},
 	"TestAutoloadClasses": {
 		"CloudflarePurgeArrayLogger": "tests/phpunit/unit/CloudflarePurgeArrayLogger.php",
+		"CloudflarePurgeBudgetGateProbe": "tests/phpunit/unit/CloudflarePurgeBudgetGateProbe.php",
 		"CloudflarePurgeCapturingRelayer": "tests/phpunit/integration/CloudflarePurgeCapturingRelayer.php",
 		"CloudflarePurgeLadderProbe": "tests/phpunit/unit/CloudflarePurgeLadderProbe.php",
+		"CloudflarePurgeRealSeamGate": "tests/phpunit/unit/CloudflarePurgeRealSeamGate.php",
 		"CloudflarePurgeSocketProbe": "tests/phpunit/unit/CloudflarePurgeSocketProbe.php"
 	},
 	"Hooks": {
