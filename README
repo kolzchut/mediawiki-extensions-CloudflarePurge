@@ -222,6 +222,41 @@ the backlink fan-out and nobody is waiting on it; clipping it would trade
 a bounded editor stall for exactly the stale pages this extension exists
 to prevent.
 
+Standing down is itself logged, because on its own it is indistinguishable
+from the case it is not meant to cover. If anything writes output before
+the pre-send deferred update runs — a stray debug print, an extension
+echoing, an output buffer flushed early — `headers_sent()` is true on a
+path where an editor genuinely *is* waiting, and the bound silently does
+not arm. The only symptom would be a save that stalls for the full
+un-budgeted ladder above, which is the failure the budget exists to
+prevent and the hardest one to attribute afterwards.
+
+So a *configured* budget that is declined writes one line, and the line
+names which condition declined it:
+
+```
+Cloudflare pre-send purge budget of 5s not applied: cli           (debug)
+Cloudflare pre-send purge budget of 5s not applied: headers-sent  (info)
+```
+
+Same message either way, so one grep finds both; the `reason` context key
+and the level tell them apart. The levels follow how often each can
+legitimately fire. `cli` is every purge the job runner makes, so it is
+debug — the answer stays next to the purge it belongs to without a
+per-job line reading as a finding. `headers-sent` is reached only by a
+*web* request, the CLI test having already returned; on a wiki with
+`$wgJobRunRate = 0` — the only configuration in which this budget is the
+sole thing between an editor and a Cloudflare outage — no web request
+runs a job after its response is flushed, so it cannot fire in normal
+operation, and info makes it a rare line worth reading. A wiki that does
+run jobs post-send sees it at that rate instead, where the reason code
+says plainly that it is expected traffic.
+
+A budget of `0` is **not** logged. Nothing was configured, so there is no
+decline to report, and a line there would fire on every purge call of
+every wiki that deliberately removed the bound — the kind of message
+readers learn to filter, which would take the rare one with it.
+
 When the budget does stop a call, the URLs it did not reach are handed to
 MediaWiki's own `CdnPurgeJob` — the job core uses for its rebound purges —
 so the clip is a *deferral*, not a loss. `CdnPurgeJob::run()` calls
@@ -273,6 +308,15 @@ budgets, to show that the clamped timeout reaches libcurl and is what ends
 the attempt. It takes a couple of seconds; with the clamp removed the same
 test takes 45.
 
+`CloudflarePurgeBudgetGateTest` is about a third thing: whether the budget
+armed, and whether it said so when it did not. Its four fast cases stub the
+two conditions (`MW_ENTRY_POINT` is a constant, and this suite forbids
+output, so neither is settable in-process) — but a stubbed seam cannot show
+that the seam is wired to the function it names, so a fifth case runs the
+gate in a subprocess that flushes real output and asks the real
+`headers_sent()`. Verified by mutation: hard-coding the seam to `false`
+leaves all four stubbed cases green and reddens only that one.
+
 `tests/phpunit/integration` is an upgrade canary rather than a test of
 this extension: it asserts that *MediaWiki* still queues backlink jobs and
 still broadcasts their URLs on `cdn-url-purges`, which is the assumption
@@ -289,7 +333,7 @@ The unit suite needs no MediaWiki, no `LocalSettings.php` and no database
 
 ```sh
 composer update          # composer.lock is not committed
-composer phpunit         # 53 tests, ~2.2s
+composer phpunit         # 60 tests, ~2.2s
 composer test            # parallel-lint + phpcs + minus-x
 ```
 

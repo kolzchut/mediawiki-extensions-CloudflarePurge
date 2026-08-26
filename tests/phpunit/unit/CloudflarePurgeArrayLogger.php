@@ -1,11 +1,11 @@
 <?php
 
 /**
- * The smallest thing CloudflarePurge::sendChunk() will accept as a logger.
+ * The smallest thing CloudflarePurge will accept as a logger.
  *
- * Deliberately not a Psr\Log\LoggerInterface: sendChunk() takes an untyped
- * $logger and calls only error() and warning(), so keeping this to those two
- * methods lets the ladder tests run with no dependency beyond PHPUnit.
+ * Deliberately not a Psr\Log\LoggerInterface: the code under test takes an
+ * untyped $logger and calls only the four methods below, so keeping this to
+ * those lets the tests run with no dependency beyond PHPUnit.
  */
 class CloudflarePurgeArrayLogger {
 
@@ -26,6 +26,22 @@ class CloudflarePurgeArrayLogger {
 	 */
 	public function warning( $message, array $context = [] ) {
 		$this->lines[] = [ 'warning', $message, $context ];
+	}
+
+	/**
+	 * @param string $message
+	 * @param array $context
+	 */
+	public function info( $message, array $context = [] ) {
+		$this->lines[] = [ 'info', $message, $context ];
+	}
+
+	/**
+	 * @param string $message
+	 * @param array $context
+	 */
+	public function debug( $message, array $context = [] ) {
+		$this->lines[] = [ 'debug', $message, $context ];
 	}
 
 	/**

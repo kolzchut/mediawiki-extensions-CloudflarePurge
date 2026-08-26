@@ -34,6 +34,22 @@ class CloudflarePurge {
 	public const CHUNK_OUT_OF_TIME = 'out-of-time';
 
 	/**
+	 * @var string One message for both ways a configured budget is declined.
+	 *
+	 * Shared rather than written twice so that "was the budget on for this
+	 * purge?" is a single grep. The two cases differ by {reason} and by
+	 * level, not by wording.
+	 */
+	private const BUDGET_DECLINED_MESSAGE =
+		'Cloudflare pre-send purge budget of {budget}s not applied: {reason}';
+
+	/** @var string Declined because this is a command-line entry point */
+	private const DECLINED_CLI = 'cli';
+
+	/** @var string Declined because the response was already flushed */
+	private const DECLINED_HEADERS_SENT = 'headers-sent';
+
+	/**
 	 * Cloudflare's purge endpoint, as a sprintf pattern over the zone ID.
 	 *
 	 * Behind a method rather than inline so a test can point the real request
@@ -63,6 +79,28 @@ class CloudflarePurge {
 	 */
 	protected static function sleepSeconds( float $seconds ) {
 		usleep( (int)round( $seconds * 1000000 ) );
+	}
+
+	/**
+	 * Whether this process is a command-line entry point. A seam, for the
+	 * same reason now() is one: MW_ENTRY_POINT is a constant, so a test that
+	 * read it directly could only ever reach one of its two branches per process.
+	 *
+	 * @return bool
+	 */
+	protected static function isCommandLine(): bool {
+		return defined( 'MW_ENTRY_POINT' ) && MW_ENTRY_POINT === 'cli';
+	}
+
+	/**
+	 * Whether the response has already been flushed. A seam: the only way to
+	 * make the real headers_sent() true is to emit output, and this suite
+	 * runs under beStrictAboutOutputDuringTests.
+	 *
+	 * @return bool
+	 */
+	protected static function headersSent(): bool {
+		return headers_sent();
 	}
 
 	/**
@@ -221,8 +259,8 @@ class CloudflarePurge {
 		);
 
 		$retries = max( 0, (int)$config->get( 'CloudflarePurgeMaxRetries' ) );
-		$budget = self::budgetForThisCall(
-			(float)$config->get( 'CloudflarePurgePreSendBudgetSeconds' )
+		$budget = static::budgetForThisCall(
+			(float)$config->get( 'CloudflarePurgePreSendBudgetSeconds' ), $logger
 		);
 
 		return static::sendChunks(
@@ -409,17 +447,72 @@ class CloudflarePurge {
 	 * same way (DeferredUpdates::doUpdates() tests !headers_sent() to decide
 	 * whether a PRESEND update can still affect the response).
 	 *
+	 * Both of those exits are also logged, because on their own they are
+	 * indistinguishable from the case they are not meant to cover. If
+	 * anything writes output before the pre-send deferred update runs — a
+	 * stray debug print, an extension echoing, an output buffer flushed early
+	 * — headers_sent() is true on a path where an editor genuinely is
+	 * waiting, and the bound silently does not arm. The only symptom would
+	 * then be a save that stalls for the full un-budgeted ladder, which is
+	 * exactly the failure the budget exists to prevent and the hardest one to
+	 * attribute afterwards. A line here makes "the budget was off" a
+	 * greppable fact rather than an inference.
+	 * (kolzchut/kz-infrastructure#1039)
+	 *
+	 * The two levels are chosen by how often each can legitimately fire, and
+	 * this channel is why it matters: this extension's log channel is routed to
+	 * the error log at DEBUG on both Kol-Zchut wikis, so a debug line here is
+	 * really written rather than merely available to whoever turns debugging on.
+	 *
+	 * - CLI is the dedicated job runner, which is the majority of all purge
+	 *   calls. Every one of them declines the budget by design, so this is
+	 *   debug: the answer stays available next to the purge it belongs to,
+	 *   without putting a per-job line at a level anyone reads as a finding.
+	 * - Headers-sent is reached only by a *web* request, the CLI test having
+	 *   already returned. On a wiki with $wgJobRunRate = 0 — the only
+	 *   configuration in which the pre-send budget is the sole thing standing
+	 *   between an editor and a Cloudflare outage — no web request runs a job
+	 *   after its response is flushed, so this cannot fire in normal
+	 *   operation and info is a rare line worth reading. A wiki that does run
+	 *   jobs post-send will see it at that rate instead; there it is expected
+	 *   traffic rather than a finding, and the reason code says so.
+	 *
+	 * Protected, not private, so a test subclass can drive the gate directly:
+	 * the two conditions are process-global (a constant, and whether output has
+	 * been flushed), which is why both are behind seams above.
+	 *
+	 * A budget of 0 is NOT logged. It is not a decline — nothing was
+	 * configured, so there is nothing to report — and a line there would fire
+	 * on every purge call of every wiki that has deliberately removed the
+	 * bound. That is the kind of message readers learn to filter, and the two
+	 * above would be filtered with it.
+	 *
 	 * @param float $seconds Configured budget; 0 or less disables it
+	 * @param Psr\Log\LoggerInterface $logger
 	 * @return CloudflarePurgeBudget
 	 */
-	private static function budgetForThisCall( float $seconds ): CloudflarePurgeBudget {
+	protected static function budgetForThisCall(
+		float $seconds, $logger
+	): CloudflarePurgeBudget {
 		if ( $seconds <= 0 ) {
 			return CloudflarePurgeBudget::unlimited();
 		}
-		if ( defined( 'MW_ENTRY_POINT' ) && MW_ENTRY_POINT === 'cli' ) {
+		if ( static::isCommandLine() ) {
+			$logger->debug( self::BUDGET_DECLINED_MESSAGE, [
+				'budget' => $seconds,
+				'reason' => self::DECLINED_CLI,
+			] );
 			return CloudflarePurgeBudget::unlimited();
 		}
-		if ( headers_sent() ) {
+		if ( static::headersSent() ) {
+			$logger->info( self::BUDGET_DECLINED_MESSAGE, [
+				'budget' => $seconds,
+				'reason' => self::DECLINED_HEADERS_SENT,
+				// Which web entry point flushed early is the first thing
+				// anyone chasing this will want, and it is not recoverable
+				// from the rest of the line.
+				'entryPoint' => defined( 'MW_ENTRY_POINT' ) ? MW_ENTRY_POINT : 'unknown',
+			] );
 			return CloudflarePurgeBudget::unlimited();
 		}
 
