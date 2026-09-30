@@ -50,6 +50,23 @@ class CloudflarePurge {
 	private const DECLINED_HEADERS_SENT = 'headers-sent';
 
 	/**
+	 * @var string A zone is configured but there is nothing to authenticate
+	 *   against it with, so no request was sent.
+	 *
+	 * One constant so "did a lapsed credential stop purging?" is a single
+	 * grep. The line carries a {reason} code and never a credential value.
+	 */
+	private const NO_CREDENTIAL_MESSAGE =
+		'Cloudflare purge not sent: a zone is configured but no usable credential is ({reason}); ' .
+		'{count} URL(s) will stay stale until their TTL expires';
+
+	/** @var string Neither a token nor any part of the legacy email + key pair */
+	private const NO_CREDENTIAL_NONE = 'no-token';
+
+	/** @var string Half of the legacy email + key pair, which cannot authenticate */
+	private const NO_CREDENTIAL_PARTIAL = 'partial-legacy-credential';
+
+	/**
 	 * Cloudflare's purge endpoint, as a sprintf pattern over the zone ID.
 	 *
 	 * Behind a method rather than inline so a test can point the real request
@@ -198,30 +215,58 @@ class CloudflarePurge {
 	 * @return bool True if everything that was attempted succeeded
 	 */
 	public static function purgeUrls( array $urls ) {
-		$config = MediaWikiServices::getInstance()->getMainConfig();
-		$logger = LoggerFactory::getInstance( 'CloudflarePurge' );
+		return static::purgeUrlsWithConfig(
+			$urls,
+			MediaWikiServices::getInstance()->getMainConfig(),
+			LoggerFactory::getInstance( 'CloudflarePurge' )
+		);
+	}
 
+	/**
+	 * The body of purgeUrls(), with its two MediaWiki services passed in.
+	 *
+	 * Split out so the configuration decisions — above all, what happens when
+	 * a zone is configured but no credential is — can be tested without a
+	 * wiki. Everything purgeUrls() does happens here.
+	 *
+	 * @param string[] $urls
+	 * @param MediaWiki\Config\Config $config Anything with get( $name )
+	 * @param Psr\Log\LoggerInterface $logger
+	 * @return bool True if everything that was attempted succeeded
+	 */
+	protected static function purgeUrlsWithConfig( array $urls, $config, $logger ) {
 		$zoneID = $config->get( 'CloudflarePurgeZoneID' );
 		if ( !$zoneID ) {
+			// No zone means no CDN to purge: an unconfigured install, not a
+			// failure. Deliberately silent — a line here would fire on every
+			// purge of every wiki that does not use Cloudflare.
 			return true;
 		}
 
-		$purgeToken = $config->get( 'CloudflarePurgeToken' );
-		$authEmail = $config->get( 'CloudflarePurgeAuthEmail' );
-		$authKey = $config->get( 'CloudflarePurgeAuthKey' );
-		if ( $purgeToken ) {
-			$headers = [
-				'Authorization: Bearer ' . $purgeToken,
-				'Content-Type: application/json'
-			];
-		} elseif ( $authEmail && $authKey ) {
-			$headers = [
-				'X-Auth-Email: ' . $authEmail,
-				'X-Auth-Key: ' . $authKey,
-				'Content-Type: application/json'
-			];
-		} else {
-			return true;
+		$headers = self::authHeaders(
+			(string)$config->get( 'CloudflarePurgeToken' ),
+			(string)$config->get( 'CloudflarePurgeAuthEmail' ),
+			(string)$config->get( 'CloudflarePurgeAuthKey' )
+		);
+		if ( is_string( $headers ) ) {
+			// A zone IS configured, so the operator has declared a CDN in
+			// front of this wiki; being unable to authenticate against it is
+			// "could not do it", not "nothing to do". Until
+			// kolzchut/kz-infrastructure#1076 this returned success silently,
+			// so a token that lapsed or was rotated away stopped every purge
+			// with no signal anywhere — the edit saved, the extension reported
+			// success, and readers kept seeing the old page for a full TTL.
+			//
+			// Nothing is deferred to the job queue: the job would run with the
+			// same configuration and fail the same way. Error level because
+			// this is a misconfiguration no healthy environment is ever in,
+			// and every purge it swallows is a stale page.
+			$logger->error( self::NO_CREDENTIAL_MESSAGE, [
+				'reason' => $headers,
+				'count' => count( $urls ),
+				'firstUrl' => $urls ? (string)reset( $urls ) : '',
+			] );
+			return false;
 		}
 
 		$set = CloudflarePurgeUrlSet::fromUrls(
@@ -266,6 +311,42 @@ class CloudflarePurge {
 		return static::sendChunks(
 			$chunks, $zoneID, $headers, $retries, $logger, $budget, $set->getUrlCount()
 		);
+	}
+
+	/**
+	 * The request headers for whichever credential is configured.
+	 *
+	 * A token wins over the legacy email + key pair. A value that is empty
+	 * or whitespace counts as absent: the token is read from the environment
+	 * as `getenv( ... ) ?: ''`, and a blank value there is a lapsed
+	 * credential, not a usable one.
+	 *
+	 * @param string $token
+	 * @param string $email
+	 * @param string $key
+	 * @return string[]|string The headers, or one of the NO_CREDENTIAL_*
+	 *   reason codes when nothing usable is configured. Never a value that
+	 *   includes the credential in the failure case, so the caller can log
+	 *   the return value as-is.
+	 */
+	private static function authHeaders( string $token, string $email, string $key ) {
+		if ( trim( $token ) !== '' ) {
+			return [
+				'Authorization: Bearer ' . $token,
+				'Content-Type: application/json'
+			];
+		}
+		$hasEmail = trim( $email ) !== '';
+		$hasKey = trim( $key ) !== '';
+		if ( $hasEmail && $hasKey ) {
+			return [
+				'X-Auth-Email: ' . $email,
+				'X-Auth-Key: ' . $key,
+				'Content-Type: application/json'
+			];
+		}
+
+		return ( $hasEmail || $hasKey ) ? self::NO_CREDENTIAL_PARTIAL : self::NO_CREDENTIAL_NONE;
 	}
 
 	/**

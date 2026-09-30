@@ -139,6 +139,17 @@ somewhere real — under a `MonologSpi` with a `'@default' => null` fallback,
 an unlisted channel is silently discarded and a failed purge becomes
 invisible.
 
+**A zone without a credential is a failure, not a no-op.** With
+`$wgCloudflarePurgeZoneID` set but neither a token nor a complete email + key
+pair (a blank value counts as unset), no request is sent, the purge returns
+failure, and the channel gets one error line per purge call:
+`Cloudflare purge not sent: a zone is configured but no usable credential is
+({reason})`, where the reason is `no-token` or `partial-legacy-credential`.
+The line never carries a credential value. This is the state a running wiki
+lands in when its token lapses or is rotated away, so grep for it before
+blaming the cache. With no zone ID at all the extension stays a silent no-op:
+that is an install without Cloudflare, not a misconfiguration.
+
 Retries are deliberately narrow, and they sort transport failures into
 three classes rather than two. HTTP 429 and 5xx are retried
 (`$wgCloudflarePurgeMaxRetries`) with a short exponential backoff, and a
