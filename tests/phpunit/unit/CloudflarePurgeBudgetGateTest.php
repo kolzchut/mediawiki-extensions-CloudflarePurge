@@ -124,25 +124,52 @@ class CloudflarePurgeBudgetGateTest extends TestCase {
 	}
 
 	/**
-	 * The seams the three tests above replace are wired to the functions they
-	 * name.
+	 * Both seams the tests above replace are wired to what they name, and the
+	 * decline line carries the real entry point.
 	 *
 	 * Stubbing isCommandLine() and headersSent() is what makes the gate
 	 * testable at all, and it is also the one thing those tests cannot check:
-	 * a seam hard-coded to false would pass every one of them. headers_sent()
-	 * is irreversible within a process, so this runs in a subprocess that
-	 * flushes real output and asks the real gate what it did.
+	 * a seam hard-coded to false would pass every one of them. Both conditions
+	 * are irreversible within a process — MW_ENTRY_POINT is a constant and
+	 * headers_sent() cannot be un-sent — so each case runs in its own
+	 * subprocess, which defines the constant for real (or leaves it undefined),
+	 * flushes real output, and asks the unstubbed gate what it did.
+	 *
+	 * What each case is there to catch:
+	 * - 'cli' is the only case where the real isCommandLine() is true. Without
+	 *   it, isCommandLine() could return false outright — or read the wrong
+	 *   constant, or compare against the wrong value — and nothing would notice.
+	 * - 'index' is a defined, non-CLI entry point. It is what fails if
+	 *   isCommandLine() stops comparing and only asks whether the constant is
+	 *   defined, and it is the only case in which the decline line's
+	 *   entryPoint is a real value rather than the 'unknown' fallback — the
+	 *   value someone chasing an early flush actually needs.
+	 * - Undefined is the state of the PHPUnit process itself, and of any
+	 *   caller that reaches the gate outside a MediaWiki entry point; it pins
+	 *   the fallback and the real headers_sent() seam.
+	 *
+	 * @dataProvider provideEntryPoints
+	 * @param string|null $entryPoint MW_ENTRY_POINT for the subprocess; null leaves it undefined
+	 * @param array $expectBefore [ limited, lines ] before output is flushed
+	 * @param array $expectAfter [ limited, lines ] after output is flushed
 	 */
-	public function testRealHeadersSentDeclinesARealBudget() {
-		$fixture = __DIR__ . '/fixtures/realHeadersSentGate.php';
+	public function testRealSeamsDriveARealBudget(
+		?string $entryPoint, array $expectBefore, array $expectAfter
+	) {
+		$fixture = __DIR__ . '/fixtures/realSeamGate.php';
 		$output = [];
 		$status = null;
-		// Shelling out is the point, not an oversight: see the docblock. Both
-		// arguments are paths this file computed, not input.
+		// Shelling out is the point, not an oversight: see the docblock. Every
+		// argument is a path this file computed or a literal from the provider,
+		// not input.
 		// phpcs:ignore MediaWiki.Usage.ForbiddenFunctions.escapeshellarg
-		$command = escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( $fixture ) . ' 2>&1';
+		$command = escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( $fixture );
+		if ( $entryPoint !== null ) {
+			// phpcs:ignore MediaWiki.Usage.ForbiddenFunctions.escapeshellarg
+			$command .= ' ' . escapeshellarg( $entryPoint );
+		}
 		// phpcs:ignore MediaWiki.Usage.ForbiddenFunctions.exec
-		exec( $command, $output, $status );
+		exec( $command . ' 2>&1', $output, $status );
 		$this->assertSame( 0, $status, implode( "\n", $output ) );
 
 		$result = json_decode( end( $output ), true );
@@ -154,18 +181,39 @@ class CloudflarePurgeBudgetGateTest extends TestCase {
 		$this->assertFalse( $result['headersSentBefore'] );
 		$this->assertTrue( $result['headersSentAfter'] );
 
-		// Before: the editor path. Armed, and silent.
-		$this->assertTrue( $result['beforeLimited'] );
-		$this->assertSame( 5, $result['beforeSeconds'] );
-		$this->assertSame( [], $result['beforeLines'] );
+		// Before: nothing flushed yet.
+		$this->assertSame( $expectBefore[0], $result['beforeLimited'] );
+		if ( $expectBefore[0] ) {
+			$this->assertSame( 5, $result['beforeSeconds'] );
+		}
+		$this->assertSame( $expectBefore[1], $result['beforeLines'] );
 
 		// After: the same call, the same budget, output flushed in between.
-		// Unbounded now — and it says so.
-		$this->assertFalse( $result['afterLimited'] );
-		$this->assertSame( [ [ 'info', self::MESSAGE, [
-			'budget' => 5,
-			'reason' => 'headers-sent',
-			'entryPoint' => 'unknown',
-		] ] ], $result['afterLines'] );
+		$this->assertSame( $expectAfter[0], $result['afterLimited'] );
+		$this->assertSame( $expectAfter[1], $result['afterLines'] );
+	}
+
+	/**
+	 * @return array[]
+	 */
+	public static function provideEntryPoints() {
+		$headersSent = static function ( string $entryPoint ): array {
+			return [ [ 'info', self::MESSAGE, [
+				'budget' => 5,
+				'reason' => 'headers-sent',
+				'entryPoint' => $entryPoint,
+			] ] ];
+		};
+		$cli = [ [ 'debug', self::MESSAGE, [ 'budget' => 5, 'reason' => 'cli' ] ] ];
+
+		return [
+			// Armed and silent until output is flushed; unbounded after, and
+			// says so, naming the entry point that flushed.
+			'undefined' => [ null, [ true, [] ], [ false, $headersSent( 'unknown' ) ] ],
+			'index' => [ 'index', [ true, [] ], [ false, $headersSent( 'index' ) ] ],
+			// The job runner: stands down before anything is flushed, and after
+			// it still reports 'cli' — the CLI test comes first.
+			'cli' => [ 'cli', [ false, $cli ], [ false, $cli ] ],
+		];
 	}
 }

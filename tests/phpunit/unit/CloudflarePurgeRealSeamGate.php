@@ -10,7 +10,7 @@
  * neither, so the gate reads the real headers_sent() and the real
  * MW_ENTRY_POINT.
  *
- * Only reachable from tests/phpunit/unit/fixtures/realHeadersSentGate.php,
+ * Only reachable from tests/phpunit/unit/fixtures/realSeamGate.php,
  * which runs it in a subprocess: headers_sent() cannot be un-sent, so making
  * it true in the test process would arm that condition for every test after.
  */
