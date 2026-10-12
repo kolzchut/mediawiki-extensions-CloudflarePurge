@@ -5,3 +5,4 @@ composer.lock
 /.eslintcache
 junit.xml
 .phpunit.result.cache
+__pycache__/

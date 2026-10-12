@@ -271,3 +271,48 @@ jobs:
           fi
           echo '::error::phpunit exited 0 but wrote no junit.xml - the guard that catches a renamed or deleted wall-clock test could not run'
           exit 1
+
+  timing-trend:
+    # kolzchut/kz-infrastructure#1049. The step above judges one run against
+    # a fixed 60% line; this judges it against the branch's own past, so a
+    # slide shows while most of the slack is left. The history is the
+    # timing annotations GitHub already keeps on every earlier run's check
+    # runs - nothing is uploaded or stored, so there is nothing to expire,
+    # race or poison from a PR. Rules and thresholds: .github/timing-trend.py.
+    #
+    # Red only on a push to kolzchut-main, which mails whoever merged through
+    # GitHub's ordinary failed-run notification. On a PR it warns and writes
+    # the job summary: runner drift is not the author's to fix.
+    #
+    # COST. One small job (~10s of steps, sparse checkout, no setup) and
+    # ~4 read-only API calls per historical run, made concurrently. The repo
+    # is public, so the minutes are free either way.
+    name: Timing trend (early warning)
+    needs: test
+    # The judgement needs this run's measurements, so it waits for the test
+    # jobs, but it still runs when one of them failed: the others' samples
+    # are valid, and a missing one is reported, not skipped.
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read   # list this workflow's runs and their jobs
+      checks: read    # read each job's annotations
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github
+
+      - name: Test the trend rules
+        # Includes the contract test that runs timing-margins.py and parses
+        # its output, so a reworded measurement line goes red here rather
+        # than silently emptying the history.
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s .github
+
+      - name: Compare against the kolzchut-main history
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/timing-trend.py

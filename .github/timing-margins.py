@@ -29,13 +29,18 @@ on purpose, update CLASS below in the same commit.
 Times come from PHPUnit's JUnit log, which includes setUp and tearDown, so
 the reported elapsed is an upper bound on what the test itself measured.
 
-KNOWN LIMIT (a follow-up, not a fix): the escalation has no memory.
-Annotations are per-run and nothing aggregates them, so a gradual slowdown
-stays invisible until a single run crosses the threshold — by which point
-most of the slack is already gone, and a warning notifies no one. Treat it as
-a late tripwire, not the early-warning system the wording above suggests.
+TREND. Each line here is a single run's view, so on its own it is a late
+tripwire: it escalates only once one run has used WARN_AT of the slack. The
+memory lives next door: timing-trend.py reads these same annotations back
+from earlier runs on kolzchut-main and fails the merge run when the recent
+median drifts or climbs, well before WARN_AT. That makes the wording of the
+measurement line a contract — test_timing_trend.py runs this script and
+parses its output, so rewording it fails a test instead of emptying the
+trend. The lines are also written to the job summary, so a green run shows
+them without opening the log.
 """
 
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -87,6 +92,7 @@ def main(path: str) -> int:
         )
         return 1
 
+    lines = []
     for budget, elapsed in measured:
         ceiling = budget + CEILING_SLACK
         used = (elapsed - budget) / CEILING_SLACK
@@ -98,11 +104,19 @@ def main(path: str) -> int:
             # Faster than the test's own lower-bound assertion allows, so
             # something other than the deadline ended the attempt — a proxy
             # answering for the loopback socket does exactly this.
-            print(f"::warning::{line} — implausibly fast, not a real measurement")
+            line += " — implausibly fast, not a real measurement"
+            print(f"::warning::{line}")
         elif used >= WARN_AT:
             print(f"::warning::{line}")
         else:
             print(f"::notice::{line}")
+        lines.append(line)
+
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            fh.write("### Wall-clock timing margins\n\n")
+            fh.writelines(f"- {line}\n" for line in lines + unmeasured)
     return 0
 
 
