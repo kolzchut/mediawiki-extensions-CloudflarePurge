@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "CloudflarePurge",
-	"version": "1.3",
+	"version": "1.4",
 	"url": "https://www.mediawiki.org/wiki/Extension:CloudflarePurge",
 	"author": "[https://www.mediawiki.org/wiki/User:Sophivorus Sophivorus]",
 	"descriptionmsg": "cloudflarepurge-desc",
@@ -28,12 +28,14 @@
 		"CloudflarePurgeCapturingRelayer": "tests/phpunit/integration/CloudflarePurgeCapturingRelayer.php",
 		"CloudflarePurgeConfigProbe": "tests/phpunit/unit/CloudflarePurgeConfigProbe.php",
 		"CloudflarePurgeLadderProbe": "tests/phpunit/unit/CloudflarePurgeLadderProbe.php",
+		"CloudflarePurgeLinksUpdateProbe": "tests/phpunit/unit/CloudflarePurgeLinksUpdateProbe.php",
 		"CloudflarePurgeRealSeamGate": "tests/phpunit/unit/CloudflarePurgeRealSeamGate.php",
 		"CloudflarePurgeSocketProbe": "tests/phpunit/unit/CloudflarePurgeSocketProbe.php"
 	},
 	"Hooks": {
 		"PageSaveComplete": "CloudflarePurge::onPageSaveComplete",
-		"PageDeleteComplete": "CloudflarePurge::onPageDeleteComplete"
+		"PageDeleteComplete": "CloudflarePurge::onPageDeleteComplete",
+		"LinksUpdateComplete": "CloudflarePurge::onLinksUpdateComplete"
 	},
 	"config": {
 		"CloudflarePurgeZoneID": {

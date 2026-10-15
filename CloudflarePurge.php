@@ -60,6 +60,26 @@ class CloudflarePurge {
 		'Cloudflare purge not sent: a zone is configured but no usable credential is ({reason}); ' .
 		'{count} URL(s) will stay stale until their TTL expires';
 
+	/**
+	 * @var string[] LinksUpdate causes that never queue a purge from
+	 *   onLinksUpdateComplete().
+	 *
+	 * refresh-links-maintenance is maintenance/refreshLinks.php, the one bulk
+	 * source of non-recursive LinksUpdates in core. A whole-wiki run (about
+	 * 16,000 pages on the Hebrew main wiki) would queue one Cloudflare request
+	 * per page. Job runners draining such queues at once (one per language,
+	 * all sharing the token) can pass the API's limit of 1,200 requests per
+	 * 5 minutes. Cloudflare then answers 429 with a Retry-After longer than
+	 * CloudflarePurgeRetryPolicy::MAX_RETRY_AFTER_SECONDS, so every purge in
+	 * that window, editors' included, would be dropped. The script re-derives
+	 * link tables; it is not a content change.
+	 *
+	 * Imports are not listed. A revision that becomes the page's latest is a
+	 * changed page, which runs a recursive update and never reaches the
+	 * handler.
+	 */
+	private const SKIPPED_LINKS_UPDATE_CAUSES = [ 'refresh-links-maintenance' ];
+
 	/** @var string Neither a token nor any part of the legacy email + key pair */
 	private const NO_CREDENTIAL_NONE = 'no-token';
 
@@ -146,7 +166,7 @@ class CloudflarePurge {
 	/**
 	 * @return bool Whether purges arrive via MediaWiki's CDN purge stream
 	 */
-	private static function relayEnabled(): bool {
+	protected static function relayEnabled(): bool {
 		$config = MediaWikiServices::getInstance()->getMainConfig();
 		if ( !$config->get( 'CloudflarePurgeUseCdnRelay' ) ) {
 			return false;
@@ -189,6 +209,94 @@ class CloudflarePurge {
 		}
 		$title = Title::newFromPageIdentity( $page );
 		self::purge( $title->getFullURL() );
+	}
+
+	/**
+	 * Purge a page after a job has re-rendered it, e.g. because a template it
+	 * transcludes was edited.
+	 *
+	 * Core leaves that purge to the page's leaf HTMLCacheUpdateJob, and that
+	 * job only purges the pages whose page_touched it bumps itself: its UPDATE
+	 * is guarded by `page_touched < rootJobTimestamp`, on the assumption that
+	 * whatever bumped a page after the edit also purged it. Semantic MediaWiki
+	 * breaks that assumption. Its LinksUpdateComplete handler forces a store
+	 * update for every page re-rendered after a template edit, and the store
+	 * update calls Title::invalidateCache() on the page, which bumps
+	 * page_touched and purges nothing. Whenever the page's refreshLinks job
+	 * runs before its htmlCacheUpdate job (JobQueueGroup::pop() picks queue
+	 * types in random order), the guard skips the page, no purge is issued,
+	 * and the edge keeps the old HTML for a full $wgCdnMaxAge
+	 * (kolzchut/kz-infrastructure#615).
+	 *
+	 * So a non-recursive LinksUpdate, which is what a job-driven re-render
+	 * runs (a direct edit runs a recursive one, and core purges the edited
+	 * page itself), queues a purge of the page's URLs. It is queued as a job
+	 * rather than sent from here because the invalidateCache() above is a
+	 * deferred update that runs after this hook. A purge sent before it
+	 * lands could be refilled at once from the still-valid parser cache
+	 * entry, and the edge would hold the old HTML again. With one job runner
+	 * per wiki, the queued job cannot start until this one has finished, by
+	 * which time page_touched has been bumped. A second, concurrent runner
+	 * could pop it a moment early; that narrows the gap rather than closing
+	 * it.
+	 *
+	 * What it costs: one CdnPurgeJob, and so one Cloudflare API request, per
+	 * non-recursive LinksUpdate. There is nothing to batch, because each of
+	 * the callers below updates one page at a time:
+	 * - a refreshLinks job, one page per job: after a template or file edit
+	 *   (one per transcluding page, interleaved with the refreshLinks jobs
+	 *   themselves), or an opportunistic one queued by a page view;
+	 * - a null edit, which saves no new revision, so core does not purge;
+	 * - action=purge with forcelinkupdate, already under the `linkpurge`
+	 *   rate limit.
+	 * Where the leaf HTMLCacheUpdateJob purged the page as well, the second
+	 * purge is redundant and harmless.
+	 *
+	 * The one bulk caller is skipped: see SKIPPED_LINKS_UPDATE_CAUSES.
+	 *
+	 * @param MediaWiki\Deferred\LinksUpdate\LinksUpdate $linksUpdate
+	 * @param mixed $ticket
+	 */
+	public static function onLinksUpdateComplete( $linksUpdate, $ticket ) {
+		if ( $linksUpdate->isRecursive() ) {
+			return;
+		}
+		if ( in_array( $linksUpdate->getCauseAction(), self::SKIPPED_LINKS_UPDATE_CAUSES, true ) ) {
+			return;
+		}
+		if ( !static::relayEnabled() ) {
+			return;
+		}
+		$urls = static::linksUpdateUrls( $linksUpdate->getTitle() );
+		if ( !$urls ) {
+			return;
+		}
+		static::queueCdnPurge( $urls );
+	}
+
+	/**
+	 * The URLs a re-render can change. A seam, so the handler can be tested
+	 * without MediaWiki's services.
+	 *
+	 * @param MediaWiki\Page\PageReference $page
+	 * @return string[]
+	 */
+	protected static function linksUpdateUrls( $page ): array {
+		$htmlCache = MediaWikiServices::getInstance()->getHtmlCacheUpdater();
+
+		return $htmlCache->getUrls( $page, $htmlCache::PURGE_URLS_LINKSUPDATE_ONLY );
+	}
+
+	/**
+	 * Queue one CdnPurgeJob for the given URLs. A seam, for the same reason
+	 * as linksUpdateUrls().
+	 *
+	 * @param string[] $urls
+	 */
+	protected static function queueCdnPurge( array $urls ) {
+		MediaWikiServices::getInstance()->getJobQueueGroup()->lazyPush(
+			new CdnPurgeJob( [ 'urls' => $urls ] )
+		);
 	}
 
 	/**
