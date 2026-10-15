@@ -192,6 +192,59 @@ class CloudflarePurge {
 	}
 
 	/**
+	 * Purge a page after a job has re-rendered it, e.g. because a template it
+	 * transcludes was edited.
+	 *
+	 * Core leaves that purge to the page's leaf HTMLCacheUpdateJob, and that
+	 * job only purges the pages whose page_touched it bumps itself: its UPDATE
+	 * is guarded by `page_touched < rootJobTimestamp`, on the assumption that
+	 * whatever bumped a page after the edit also purged it. Semantic MediaWiki
+	 * breaks that assumption. Its LinksUpdateComplete handler forces a store
+	 * update for every page re-rendered after a template edit, and the store
+	 * update calls Title::invalidateCache() on the page, which bumps
+	 * page_touched and purges nothing. Whenever the page's refreshLinks job
+	 * runs before its htmlCacheUpdate job (JobQueueGroup::pop() picks queue
+	 * types in random order), the guard skips the page, no purge is issued,
+	 * and the edge keeps the old HTML for a full $wgCdnMaxAge
+	 * (kolzchut/kz-infrastructure#615).
+	 *
+	 * So a non-recursive LinksUpdate, which is what a job-driven re-render
+	 * runs (a direct edit runs a recursive one, and core purges the edited
+	 * page itself), queues a purge of the page's URLs. It is queued as a job
+	 * rather than sent from here because the invalidateCache() above is a
+	 * deferred update that runs after this hook. A purge sent before it
+	 * lands could be refilled at once from the still-valid parser cache
+	 * entry, and the edge would hold the old HTML again. With one job runner
+	 * per wiki, the queued job cannot start until this one has finished, by
+	 * which time page_touched has been bumped. A second, concurrent runner
+	 * could pop it a moment early; that narrows the gap rather than closing
+	 * it.
+	 *
+	 * The cost is one more job, and one more Cloudflare request, per
+	 * re-rendered page: core's refreshLinks leaf jobs carry one page each, so
+	 * there is nothing to batch. When the leaf HTMLCacheUpdateJob did purge
+	 * the page as well, the second purge is redundant and harmless.
+	 *
+	 * @param MediaWiki\Deferred\LinksUpdate\LinksUpdate $linksUpdate
+	 * @param mixed $ticket
+	 */
+	public static function onLinksUpdateComplete( $linksUpdate, $ticket ) {
+		if ( $linksUpdate->isRecursive() || !self::relayEnabled() ) {
+			return;
+		}
+		$services = MediaWikiServices::getInstance();
+		$htmlCache = $services->getHtmlCacheUpdater();
+		$urls = $htmlCache->getUrls(
+			$linksUpdate->getTitle(),
+			$htmlCache::PURGE_URLS_LINKSUPDATE_ONLY
+		);
+		if ( !$urls ) {
+			return;
+		}
+		$services->getJobQueueGroup()->lazyPush( new CdnPurgeJob( [ 'urls' => $urls ] ) );
+	}
+
+	/**
 	 * Purge the given URL
 	 *
 	 * @param string $url URL of the page to purge

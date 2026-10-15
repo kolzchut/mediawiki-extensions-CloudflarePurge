@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "CloudflarePurge",
-	"version": "1.3",
+	"version": "1.4",
 	"url": "https://www.mediawiki.org/wiki/Extension:CloudflarePurge",
 	"author": "[https://www.mediawiki.org/wiki/User:Sophivorus Sophivorus]",
 	"descriptionmsg": "cloudflarepurge-desc",
@@ -33,7 +33,8 @@
 	},
 	"Hooks": {
 		"PageSaveComplete": "CloudflarePurge::onPageSaveComplete",
-		"PageDeleteComplete": "CloudflarePurge::onPageDeleteComplete"
+		"PageDeleteComplete": "CloudflarePurge::onPageDeleteComplete",
+		"LinksUpdateComplete": "CloudflarePurge::onLinksUpdateComplete"
 	},
 	"config": {
 		"CloudflarePurgeZoneID": {

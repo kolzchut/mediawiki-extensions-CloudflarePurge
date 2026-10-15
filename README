@@ -32,6 +32,29 @@ edited page itself.
 
 `$wgCdnServers` may stay empty — the relayer is invoked regardless of it.
 
+### Pages re-rendered by a job
+
+Core's leaf `HTMLCacheUpdateJob` purges only the pages whose `page_touched`
+it bumps itself. Its update is guarded by `page_touched < rootJobTimestamp`,
+on the assumption that whatever touched a page after the edit also purged
+it. Semantic MediaWiki breaks that assumption: when a template edit makes a
+`refreshLinks` job re-render a page, SMW's store update calls
+`Title::invalidateCache()` on it, which bumps `page_touched` and purges
+nothing. If that `refreshLinks` job runs before the page's
+`htmlCacheUpdate` job (the job queue picks types in random order), the guard
+skips the page and the edge keeps the old HTML for a full `$wgCdnMaxAge`
+(kolzchut/kz-infrastructure#615).
+
+So when the relay is active, a `LinksUpdateComplete` handler queues a
+`CdnPurgeJob` for every page whose links were refreshed by a job (a
+non-recursive `LinksUpdate`; a direct edit runs a recursive one and core
+purges the page itself). It is a job, not an immediate purge, because SMW's
+`page_touched` bump is a deferred update that runs after the hook: purging
+first would let the edge refill from the still-valid parser cache entry.
+With one job runner per wiki the job cannot start until the `refreshLinks`
+job has finished. The cost is one extra job and one Cloudflare request per
+re-rendered page, redundant when the `htmlCacheUpdate` job purged it too.
+
 ## Configuration
 
 | Variable | Type | Default | Description |
