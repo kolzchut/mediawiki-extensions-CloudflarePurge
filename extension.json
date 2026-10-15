@@ -28,6 +28,7 @@
 		"CloudflarePurgeCapturingRelayer": "tests/phpunit/integration/CloudflarePurgeCapturingRelayer.php",
 		"CloudflarePurgeConfigProbe": "tests/phpunit/unit/CloudflarePurgeConfigProbe.php",
 		"CloudflarePurgeLadderProbe": "tests/phpunit/unit/CloudflarePurgeLadderProbe.php",
+		"CloudflarePurgeLinksUpdateProbe": "tests/phpunit/unit/CloudflarePurgeLinksUpdateProbe.php",
 		"CloudflarePurgeRealSeamGate": "tests/phpunit/unit/CloudflarePurgeRealSeamGate.php",
 		"CloudflarePurgeSocketProbe": "tests/phpunit/unit/CloudflarePurgeSocketProbe.php"
 	},

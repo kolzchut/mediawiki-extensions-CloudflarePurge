@@ -46,14 +46,34 @@ skips the page and the edge keeps the old HTML for a full `$wgCdnMaxAge`
 (kolzchut/kz-infrastructure#615).
 
 So when the relay is active, a `LinksUpdateComplete` handler queues a
-`CdnPurgeJob` for every page whose links were refreshed by a job (a
-non-recursive `LinksUpdate`; a direct edit runs a recursive one and core
-purges the page itself). It is a job, not an immediate purge, because SMW's
-`page_touched` bump is a deferred update that runs after the hook: purging
-first would let the edge refill from the still-valid parser cache entry.
-With one job runner per wiki the job cannot start until the `refreshLinks`
-job has finished. The cost is one extra job and one Cloudflare request per
-re-rendered page, redundant when the `htmlCacheUpdate` job purged it too.
+`CdnPurgeJob` for the page whenever its links update is non-recursive. A
+direct edit runs a recursive one, and core purges the edited page itself.
+It is a job, not an immediate purge, because SMW's `page_touched` bump is a
+deferred update that runs after the hook: purging first would let the edge
+refill from the still-valid parser cache entry. With one job runner per wiki
+the job cannot start until the `refreshLinks` job has finished.
+
+What it costs is one extra job and one Cloudflare API request per
+non-recursive links update. Each source updates one page at a time, so there
+is nothing to batch:
+
+| Source | Purges |
+|---|---|
+| `refreshLinks` job after a template or file edit | one per transcluding page, interleaved with the `refreshLinks` jobs themselves. Redundant when that page's `htmlCacheUpdate` job purged it too |
+| opportunistic `refreshLinks` job queued by a page view | one per job |
+| null edit (a save with no new revision, which core does not purge) | one |
+| `action=purge` with `forcelinkupdate` | one per page, under the `linkpurge` rate limit (30 a minute per user or IP by default) |
+| `maintenance/refreshLinks.php` | **none**. It is skipped by cause (`refresh-links-maintenance`) |
+
+`refreshLinks.php` is skipped because it is the one bulk source. A
+whole-wiki run would queue a request per page (about 16,000 on the Hebrew
+main wiki). Runners draining such queues at once, all with the same token,
+can pass Cloudflare's limit of 1,200 requests per 5 minutes. The API then
+answers 429 with a `Retry-After` longer than
+`CloudflarePurgeRetryPolicy::MAX_RETRY_AFTER_SECONDS`, so every purge in that
+window, editors' included, would be dropped. The script re-derives link
+tables; it changes no content. Imports need no entry: an imported revision
+that becomes the latest is a changed page, which runs a recursive update.
 
 ## Configuration
 
@@ -367,7 +387,7 @@ The unit suite needs no MediaWiki, no `LocalSettings.php` and no database
 
 ```sh
 composer update          # composer.lock is not committed
-composer phpunit         # 60 tests, ~2.2s
+composer phpunit         # 79 tests, ~2.3s
 composer test            # parallel-lint + phpcs + minus-x
 ```
 
